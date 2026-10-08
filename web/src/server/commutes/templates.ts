@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
-import { parseClockMinutes } from "@/domain/clock";
+import { parseClockMinutes, normalizeArea } from "@/domain/clock";
 import { assertActiveCommunityMember, assertParticipantRole } from "@/server/community/access";
 import { withIdempotency, type IdempotentResult } from "@/server/db/idempotency";
 import { inTransaction } from "@/server/db/pool";
@@ -27,16 +27,16 @@ export type CommuteTemplateRecord = CommuteTemplateInput & {
 };
 
 function normalizeInput(input: CommuteTemplateInput): CommuteTemplateInput {
-  const originArea = input.originArea.trim().replace(/\s+/gu, " ");
-  const destinationArea = input.destinationArea.trim().replace(/\s+/gu, " ");
+  const originArea = normalizeArea(input.originArea);
+  const destinationArea = normalizeArea(input.destinationArea);
   const start = parseClockMinutes(input.departureWindowStart);
   const end = parseClockMinutes(input.departureWindowEnd);
 
-  if (originArea.length < 1 || originArea.length > 120) {
-    throw invalid("INVALID_ORIGIN_AREA", "Origin area must be between 1 and 120 characters.");
+  if (originArea === null) {
+    throw invalid("INVALID_ORIGIN_AREA", "Origin area must be 1 to 120 characters.");
   }
-  if (destinationArea.length < 1 || destinationArea.length > 120) {
-    throw invalid("INVALID_DESTINATION_AREA", "Destination area must be between 1 and 120 characters.");
+  if (destinationArea === null) {
+    throw invalid("INVALID_DESTINATION_AREA", "Destination area must be 1 to 120 characters.");
   }
   if (start === null || end === null || start > end) {
     throw invalid("INVALID_DEPARTURE_WINDOW", "Departure window must be a valid, ordered local time range.");

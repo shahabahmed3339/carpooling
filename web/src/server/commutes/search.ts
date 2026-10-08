@@ -1,4 +1,4 @@
-import { isValidDateOnly, parseClockMinutes } from "@/domain/clock";
+import { isValidDateOnly, normalizeArea, parseClockMinutes } from "@/domain/clock";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 import { getPool } from "@/server/db/pool";
 import { invalid } from "@/server/rides/errors";
@@ -33,13 +33,13 @@ export async function searchRideCandidates(input: {
     throw invalid("INVALID_DEPARTURE_TIME", "Departure time must use valid 24-hour HH:mm format.");
   }
 
-  const rawOriginArea = input.originArea.trim();
-  const rawDestinationArea = input.destinationArea.trim();
-  const normalizeArea = (value: string) => value.replace(/\s+/gu, " ").toLowerCase();
-  const originArea = normalizeArea(rawOriginArea);
-  const destinationArea = normalizeArea(rawDestinationArea);
-  if (!originArea || rawOriginArea.length > 120 || !destinationArea || rawDestinationArea.length > 120) {
-    throw invalid("INVALID_AREA", "Choose valid approximate origin and destination areas.");
+  const originArea = normalizeArea(input.originArea);
+  const destinationArea = normalizeArea(input.destinationArea);
+  if (originArea === null) {
+    throw invalid("INVALID_AREA", "Choose a valid approximate origin area.");
+  }
+  if (destinationArea === null) {
+    throw invalid("INVALID_AREA", "Choose a valid approximate destination area.");
   }
   if (
     !Number.isInteger(input.timeToleranceMinutes) ||

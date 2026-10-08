@@ -1,6 +1,7 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import SignOutButton from "@/app/auth/complete/sign-out";
 import styles from "./dashboard.module.css";
 
@@ -36,6 +37,10 @@ type RideRequest = {
   destinationArea: string;
   tripDate: string;
   departureTime: string;
+  awaitingCompletion: boolean;
+  departurePassed: boolean;
+  riderConfirmedCompletion: boolean;
+  driverConfirmedCompletion: boolean;
 };
 type DriverTrip = {
   tripOccurrenceId: string;
@@ -95,6 +100,7 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export default function DashboardClient({ initialMode, accountEmail }: { initialMode: ParticipantRole; accountEmail: string }) {
+  const router = useRouter();
   const [role, setRole] = useState<ParticipantRole>(initialMode);
   const [commutes, setCommutes] = useState<Commute[]>([]);
   const [requests, setRequests] = useState<RideRequest[]>([]);
@@ -115,54 +121,51 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   const [selectedDays, setSelectedDays] = useState<number[]>([1, 2, 3, 4, 5]);
   const [seats, setSeats] = useState(1);
   const [editingCommute, setEditingCommute] = useState<{ id: string; version: number } | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const reload = useCallback(async () => {
-    setError("");
+  const roleRef = useRef(role);
+  const loadSeqRef = useRef(0);
+
+  // Single guarded loader. A monotonic sequence number ensures a slow, earlier
+  // response can never overwrite data from a newer one (for example a reload
+  // triggered by "publish" racing the reload for a mode switch).
+  const loadDashboard = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    const activeRole = roleRef.current;
     try {
       const [commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult] = await Promise.all([
-        role === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
+        activeRole === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
         api<{ requests: RideRequest[] }>("/api/rides"),
-        role === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
+        activeRole === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
         api<{ activity: ActivityItem[] }>("/api/activity"),
         api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
         api<{ reports: SafetyReport[] }>("/api/reports"),
       ]);
+      if (seq !== loadSeqRef.current) return;
       setCommutes(commuteResult.commutes);
       setRequests(requestResult.requests);
       setPublishedTrips(tripResult.trips);
       setActivity(activityResult.activity);
       setBlockedUsers(blockResult.blocks);
       setMyReports(reportResult.reports);
+      setError("");
     } catch (cause) {
+      if (seq !== loadSeqRef.current) return;
       setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
     }
-  }, [role]);
+  }, []);
 
   useEffect(() => {
-    let mounted = true;
-    Promise.all([
-      role === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
-      api<{ requests: RideRequest[] }>("/api/rides"),
-      role === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
-      api<{ activity: ActivityItem[] }>("/api/activity"),
-      api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
-      api<{ reports: SafetyReport[] }>("/api/reports"),
-    ]).then(([commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult]) => {
-      if (!mounted) return;
-      setCommutes(commuteResult.commutes);
-      setRequests(requestResult.requests);
-      setPublishedTrips(tripResult.trips);
-      setActivity(activityResult.activity);
-      setBlockedUsers(blockResult.blocks);
-      setMyReports(reportResult.reports);
-    }).catch((cause: unknown) => {
-      if (mounted) setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
-    });
-    return () => { mounted = false; };
-  }, [role]);
+    roleRef.current = role;
+    // Defer past the effect body so the initial load happens as a subscription-like
+    // async continuation rather than a synchronous cascade during render commit.
+    const timer = setTimeout(() => { void loadDashboard(); }, 0);
+    return () => clearTimeout(timer);
+  }, [role, loadDashboard]);
 
   async function perform(action: () => Promise<void>, success: string) {
     setBusy(true);
@@ -171,7 +174,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     try {
       await action();
       setNotice(success);
-      await reload();
+      await loadDashboard();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not complete the request.");
     } finally {
@@ -280,6 +283,27 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     }, action === "accept" ? "Seat request accepted." : action === "reject" ? "Seat request declined." : "Your request was cancelled.");
   }
 
+  async function confirmCompletion(requestId: string) {
+    await perform(async () => {
+      await api(`/api/rides/${requestId}/complete`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey() },
+      });
+    }, "Thanks — your confirmation was recorded.");
+  }
+
+  async function disputeCompletion(requestId: string) {
+    const reason = window.prompt("Describe what happened with this trip.");
+    if (!reason || !reason.trim()) return;
+    await perform(async () => {
+      await api(`/api/rides/${requestId}/dispute`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey() },
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+    }, "Your report was recorded for review. It is not an emergency service; no alert is sent automatically.");
+  }
+
   async function setUserBlocked(userId: string, displayName: string, blocked: boolean) {
     if (blocked && !window.confirm(`Block ${displayName}? They will no longer appear in future matches, but existing trips and requests will remain.`)) return;
     setBusy(true);
@@ -292,7 +316,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
         : current.filter((user) => user.userId !== userId));
       if (blocked) setCandidates((current) => current.filter((candidate) => candidate.memberId !== userId));
       setNotice(blocked ? `${displayName} was blocked.` : `${displayName} was unblocked.`);
-      await reload();
+      await loadDashboard();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not update blocked users.");
     } finally {
@@ -317,6 +341,19 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
       setReportDraft(null);
       setReportDetails("");
     }, "Report submitted. It is not an emergency service; no alert is sent automatically.");
+  }
+
+  async function deleteAccount(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (deleteConfirm !== "DELETE") return;
+    await perform(async () => {
+      await api("/api/account", {
+        method: "DELETE",
+        body: JSON.stringify({ confirm: "DELETE" }),
+      });
+      // The session no longer exists; leave the authenticated area entirely.
+      router.replace("/login");
+    }, "Your account has been closed.");
   }
 
   async function switchMode(nextMode: ParticipantRole) {
@@ -397,6 +434,22 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
         ))}
       </section>
 
+      <section className={styles.panel}>
+        <h2>Your account</h2>
+        <p className={styles.muted}>Closing your account withdraws your open ride requests and cancels your future trips. Completed trips stay on the other participants’ records without your name. You will not be able to sign in again.</p>
+        {!deleteOpen ? (
+          <button className={styles.danger} disabled={busy} onClick={() => { setDeleteOpen(true); setDeleteConfirm(""); }}>Close my account</button>
+        ) : (
+          <form className={styles.form} onSubmit={deleteAccount}>
+            <label>Type DELETE to confirm<input autoComplete="off" value={deleteConfirm} onChange={(event) => setDeleteConfirm(event.target.value)} placeholder="DELETE" /></label>
+            <div className={styles.inline}>
+              <button className={styles.danger} disabled={busy || deleteConfirm !== "DELETE"}>Permanently close account</button>
+              <button className={styles.secondary} disabled={busy} type="button" onClick={() => setDeleteOpen(false)}>Keep my account</button>
+            </div>
+          </form>
+        )}
+      </section>
+
       {role === "DRIVER" ? (
         <>
           <section className={styles.panel}>
@@ -442,7 +495,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
           </section>
           <section className={styles.panel}>
             <h2>Seat requests</h2>
-            <RequestList requests={requests} role={role} busy={busy} onAction={requestAction} />
+            <RequestList requests={requests} role={role} busy={busy} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
           </section>
         </>
       ) : (
@@ -472,7 +525,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
           </section>
           <section className={styles.panel}>
             <h2>Your requests</h2>
-            <RequestList requests={requests} role={role} busy={busy} onAction={requestAction} />
+            <RequestList requests={requests} role={role} busy={busy} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
           </section>
         </>
       )}
@@ -481,18 +534,39 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   );
 }
 
-function RequestList({ requests, role, busy, onAction }: {
+function RequestList({ requests, role, busy, onAction, onConfirm, onDispute }: {
   requests: RideRequest[];
   role: ParticipantRole;
   busy: boolean;
   onAction: (requestId: string, action: "accept" | "reject" | "cancel") => Promise<void>;
+  onConfirm: (requestId: string) => Promise<void>;
+  onDispute: (requestId: string) => Promise<void>;
 }) {
   if (requests.length === 0) return <p className={styles.muted}>No requests yet.</p>;
-  return <div className={styles.list}>{requests.map((request) => (
-    <div className={styles.item} key={request.requestId}>
-      <div><strong>{request.originArea} → {request.destinationArea}</strong><p>{request.tripDate} at {request.departureTime} · {request.otherParticipantName} · {request.status.toLowerCase()}</p></div>
-      {request.status === "REQUESTED" && role === "DRIVER" && <div className={styles.inline}><button disabled={busy} onClick={() => void onAction(request.requestId, "accept")}>Accept</button><button className={styles.secondary} disabled={busy} onClick={() => void onAction(request.requestId, "reject")}>Decline</button></div>}
-      {(["REQUESTED", "ACCEPTED"].includes(request.status)) && role === "RIDER" && <button className={styles.secondary} disabled={busy} onClick={() => void onAction(request.requestId, "cancel")}>Cancel request</button>}
-    </div>
-  ))}</div>;
+  return <div className={styles.list}>{requests.map((request) => {
+    const myConfirmation = role === "DRIVER"
+      ? request.driverConfirmedCompletion
+      : request.riderConfirmedCompletion;
+    return (
+      <div className={styles.item} key={request.requestId}>
+        <div>
+          <strong>{request.originArea} → {request.destinationArea}</strong>
+          <p>{request.tripDate} at {request.departureTime} · {request.otherParticipantName} · {request.status.toLowerCase()}{request.status === "DISPUTED" ? " — awaiting operator review" : ""}</p>
+          {/* Completion controls are only meaningful for a seat that was actually granted. */}
+          {request.awaitingCompletion && request.status === "ACCEPTED" && <p className={styles.inlineMessage}>{request.riderConfirmedCompletion && request.driverConfirmedCompletion
+            ? "Both sides confirmed."
+            : myConfirmation
+              ? "You confirmed this trip. Waiting for the other participant."
+              : "This trip has departed. Confirm it happened, or report a problem."}</p>}
+          {request.status === "REQUESTED" && request.departurePassed && <p className={styles.inlineMessage}>This trip departed before the seat was accepted. The request can no longer be actioned and will be closed.</p>}
+        </div>
+        {request.status === "REQUESTED" && role === "DRIVER" && !request.departurePassed && <div className={styles.inline}><button disabled={busy} onClick={() => void onAction(request.requestId, "accept")}>Accept</button><button className={styles.secondary} disabled={busy} onClick={() => void onAction(request.requestId, "reject")}>Decline</button></div>}
+        {request.awaitingCompletion && request.status === "ACCEPTED" && <div className={styles.inline}>
+          {!myConfirmation && <button disabled={busy} onClick={() => void onConfirm(request.requestId)}>Confirm trip happened</button>}
+          <button className={styles.secondary} disabled={busy} onClick={() => void onDispute(request.requestId)}>Report a problem</button>
+        </div>}
+        {(["REQUESTED", "ACCEPTED"].includes(request.status)) && role === "RIDER" && !request.awaitingCompletion && <button className={styles.secondary} disabled={busy} onClick={() => void onAction(request.requestId, "cancel")}>Cancel request</button>}
+      </div>
+    );
+  })}</div>;
 }

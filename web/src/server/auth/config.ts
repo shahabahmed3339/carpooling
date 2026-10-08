@@ -3,7 +3,14 @@ import { magicLink } from "better-auth/plugins";
 import nextEnv from "@next/env";
 import { getPool } from "@/server/db/pool";
 
-nextEnv.loadEnvConfig(process.cwd());
+// This module is also imported outside the Next.js server (scripts, tooling).
+// `loadEnvConfig` applies `.env.local` and then `.env`; run it quietly so the
+// surrounding process is not spammed with duplicate env banners. Next.js itself
+// has already applied both files for the running server.
+nextEnv.loadEnvConfig(process.cwd(), process.env.NODE_ENV === "development", {
+  info: () => {},
+  error: () => {},
+});
 
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();

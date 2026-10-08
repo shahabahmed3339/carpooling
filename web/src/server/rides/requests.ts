@@ -7,6 +7,7 @@ import { isValidDateOnly } from "@/domain/clock";
 import { conflict, forbidden, invalid, notFound } from "./errors";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 import { lockUserPair } from "@/server/users/blocks";
+import { expireStaleTripsIn } from "@/server/rides/completion";
 
 type RequestResult = {
   requestId: string;
@@ -641,6 +642,12 @@ export type RideRequestSummary = {
   destinationArea: string;
   tripDate: string;
   departureTime: string;
+  /** True once departure has passed and the trip is still confirmable. */
+  awaitingCompletion: boolean;
+  /** True once departure has passed, regardless of request status. */
+  departurePassed: boolean;
+  riderConfirmedCompletion: boolean;
+  driverConfirmedCompletion: boolean;
 };
 
 export type DriverTripSummary = {
@@ -669,11 +676,20 @@ export type AccountActivityItem = {
   departureTime: string;
   seatCapacity: number | null;
   seatsReserved: number | null;
+  recordRef: string | null;
+  awaitingCompletion: boolean;
+  riderConfirmedCompletion: boolean;
+  driverConfirmedCompletion: boolean;
 };
 
 export async function listAccountActivity(actor: AuthenticatedActor): Promise<AccountActivityItem[]> {
   return inTransaction(async (client) => {
     await assertActiveCommunityMember(client, actor.communityId, actor.userId);
+    // Opportunistic housekeeping before reading: a trip whose confirmation
+    // window has closed should not still read as awaiting confirmation. This is
+    // the canonical sweep, so the read path also records no-show evidence and
+    // settles capacity instead of diverging from it.
+    await expireStaleTripsIn(client);
     const result = await client.query<AccountActivityItem>(
       `SELECT *
          FROM (
@@ -690,6 +706,10 @@ export async function listAccountActivity(actor: AuthenticatedActor): Promise<Ac
                   to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS "departureTime",
                   o.seat_capacity AS "seatCapacity",
                   o.seats_reserved AS "seatsReserved",
+                  NULL::uuid AS "recordRef",
+                  false AS "awaitingCompletion",
+                  false AS "riderConfirmedCompletion",
+                  false AS "driverConfirmedCompletion",
                   o.departure_at AS sort_time
              FROM trip_occurrences o
             WHERE o.community_id = $1 AND o.driver_user_id = $2
@@ -709,9 +729,17 @@ export async function listAccountActivity(actor: AuthenticatedActor): Promise<Ac
                   to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS "departureTime",
                   NULL::smallint AS "seatCapacity",
                   NULL::smallint AS "seatsReserved",
+                  o.id AS "recordRef",
+                  (r.status = 'ACCEPTED'
+                    AND o.status <> 'CANCELLED'
+                    AND o.departure_at <= now()
+                    AND o.departure_at > now() - (p.completion_window)) AS "awaitingCompletion",
+                  r.rider_confirmed_completion AS "riderConfirmedCompletion",
+                  r.driver_confirmed_completion AS "driverConfirmedCompletion",
                   o.departure_at AS sort_time
              FROM ride_requests r
              JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+             CROSS JOIN trip_policy p
              JOIN users other ON other.id = CASE
                WHEN o.driver_user_id = $2 THEN r.rider_user_id
                ELSE o.driver_user_id
@@ -764,9 +792,17 @@ export async function listRideRequests(actor: AuthenticatedActor): Promise<RideR
               o.origin_area AS "originArea",
               o.destination_area AS "destinationArea",
               to_char(o.trip_date, 'YYYY-MM-DD') AS "tripDate",
-              to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS "departureTime"
+              to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS "departureTime",
+              (r.status = 'ACCEPTED'
+                AND o.status <> 'CANCELLED'
+                AND o.departure_at <= now()
+                AND o.departure_at > now() - (p.completion_window)) AS "awaitingCompletion",
+              (o.departure_at <= now()) AS "departurePassed",
+              r.rider_confirmed_completion AS "riderConfirmedCompletion",
+              r.driver_confirmed_completion AS "driverConfirmedCompletion"
          FROM ride_requests r
          JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+         CROSS JOIN trip_policy p
          JOIN users other ON other.id = CASE
            WHEN $3::boolean THEN r.rider_user_id
            ELSE o.driver_user_id

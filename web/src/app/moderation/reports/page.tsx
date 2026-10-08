@@ -3,6 +3,17 @@
 import { useCallback, useEffect, useState } from "react";
 import styles from "@/app/dashboard/dashboard.module.css";
 
+type NoShowEvidence = {
+  requestId: string;
+  outcome: "RIDER_UNCONFIRMED" | "DRIVER_UNCONFIRMED" | "NEITHER_CONFIRMED" | "BOTH_CONFIRMED";
+  riderName: string;
+  driverName: string;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departedAt: string;
+};
+
 type Report = {
   reportId: string;
   reportedName: string;
@@ -13,15 +24,18 @@ type Report = {
   createdAt: string;
 };
 
+type ApiError = { error?: { code?: string; message?: string } };
+
 async function api<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { ...init, headers: { "Content-Type": "application/json", ...init?.headers } });
-  const payload = await response.json().catch(() => ({})) as T & { error?: { message?: string } };
+  const payload = await response.json().catch(() => ({})) as T & ApiError;
   if (!response.ok) throw new Error(payload.error?.message ?? "Could not complete the request.");
   return payload;
 }
 
 export default function ModerationReportsPage() {
   const [reports, setReports] = useState<Report[]>([]);
+  const [evidence, setEvidence] = useState<NoShowEvidence[]>([]);
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -33,9 +47,22 @@ export default function ModerationReportsPage() {
   }, []);
 
   useEffect(() => {
-    void reload().catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "Could not load reports."));
-  }, [reload]);
-
+    const controller = new AbortController();
+    Promise.all([
+      api<{ reports: Report[] }>("/api/moderation/reports", { signal: controller.signal }),
+      api<{ evidence: NoShowEvidence[] }>("/api/moderation/no-shows", { signal: controller.signal }),
+    ])
+      .then(([reportResult, evidenceResult]) => {
+        if (controller.signal.aborted) return;
+        setReports(reportResult.reports);
+        setEvidence(evidenceResult.evidence);
+      })
+      .catch((cause: unknown) => {
+        if (controller.signal.aborted) return;
+        setError(cause instanceof Error ? cause.message : "Could not load reports.");
+      });
+    return () => controller.abort();
+  }, []);
   async function update(reportId: string, status: "IN_REVIEW" | "RESOLVED" | "DISMISSED") {
     setBusyId(reportId);
     setError("");
@@ -70,5 +97,22 @@ export default function ModerationReportsPage() {
         <button className={styles.danger} disabled={busyId === report.reportId} onClick={() => void update(report.reportId, "DISMISSED")}>Dismiss</button>
       </div>
     </section>)}
+
+    <section className={styles.panel}>
+      <h2>Unconfirmed trips</h2>
+      <p className={styles.muted}>
+        Trips whose completion window closed without both sides confirming. This is evidence to look into, not a
+        finding: someone may have travelled and simply not reopened the app. Do not treat a row here as proof that a
+        person failed to show up.
+      </p>
+      {evidence.length === 0 ? <p className={styles.muted}>No unconfirmed trips.</p> : evidence.map((row) => (
+        <div className={styles.item} key={row.requestId}>
+          <div>
+            <strong>{row.outcome.replaceAll("_", " ").toLowerCase()} · {row.originArea} → {row.destinationArea}</strong>
+            <p>{row.tripDate} · rider {row.riderName} · driver {row.driverName} · departed {new Date(row.departedAt).toLocaleString()}</p>
+          </div>
+        </div>
+      ))}
+    </section>
   </main>;
 }

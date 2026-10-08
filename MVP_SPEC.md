@@ -27,6 +27,11 @@ Let any person create one email-verified account and use it as a Rider, a Driver
 10. **Privacy:** search returns approximate trip areas and only necessary participant display information. Do not expose private contact details without a valid coordination need.
 11. **Area matching:** compare trimmed area names case-insensitively and collapse repeated whitespace. Do not infer that different neighborhood names are nearby or equivalent.
 12. **Blocking:** users can block/unblock another participant. A block suppresses future matches and prevents a new request from being created or accepted; it does not automatically cancel an existing accepted trip.
+13. **Reporting:** a user can submit a safety report about a participant they share an actual trip or request with, and can see the status of their own reports. A report is stored for an assigned reviewer; it does not send an alert and is not an emergency channel.
+14. **Account closure:** a user can close their own account. Open requests are withdrawn, future trips cancelled, the account deactivated and barred from sign-in, identifying fields erased, and sessions deleted. Completed history is retained against an anonymous account row so other participants' records stay coherent. Closure is refused while a trip the user is part of has already departed.
+15. **Reviewer access:** the report queue is restricted server-side to members with the operator or safety-reviewer role. It is not visible to ordinary accounts.
+16. **Trip completion:** each side confirms independently after departure; the request becomes `COMPLETED` only when both confirm. A request unconfirmed when the completion window lapses becomes `EXPIRED`.
+17. **Unconfirmed-trip evidence:** for each expired request, record which side had confirmed, at the moment of expiry. Staff can view this as context during a review. It is evidence, never an automatic penalty: not confirming is not proof that someone did not travel.
 
 ## Non-goals for the first slice
 
@@ -35,6 +40,8 @@ Payments, escrow, location tracking, route optimization, ratings/reputation, ide
 ## Readiness and honest product language
 
 Open account creation means users can test the product flow without a pilot organizer. It does not mean a real ride has been vetted or that the platform provides emergency response. Before enabling real rides, ship support/reporting/blocking, cancellation/no-show terms, retention/deletion controls, and an incident process; complete applicable qualified local review.
+
+Trip completion exists, but no-show *policy* does not: the app records that a confirmation never arrived and shows it to staff, yet nothing acts on it. There is no threshold, warning, suspension, or appeal path, so the evidence should be read only as context during a human review.
 
 ## Technical constraints
 

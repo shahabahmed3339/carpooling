@@ -9,6 +9,20 @@ export function parseClockMinutes(value: string): number | null {
   return hours * 60 + minutes;
 }
 
+export const AREA_MAX_LENGTH = 120;
+
+/**
+ * Area inputs are free text. Matching trims, collapses repeated whitespace, and
+ * ignores case, so the stored and compared values must be normalized the same
+ * way everywhere to avoid two spellings of the same area failing to match.
+ * Returns null when the input is empty or too long after normalization.
+ */
+export function normalizeArea(value: string): string | null {
+  const normalized = value.trim().replace(/\s+/gu, " ").toLowerCase();
+  if (normalized.length < 1 || normalized.length > AREA_MAX_LENGTH) return null;
+  return normalized;
+}
+
 export function isValidDateOnly(value: string): boolean {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const date = new Date(`${value}T00:00:00.000Z`);

@@ -4,6 +4,7 @@ import { assertActiveCommunityMember } from "@/server/community/access";
 import { withIdempotency, type IdempotentResult } from "@/server/db/idempotency";
 import { inTransaction } from "@/server/db/pool";
 import { conflict, forbidden, invalid, notFound, rateLimited } from "@/server/rides/errors";
+import type { CompletionOutcome } from "@/server/rides/completion";
 import type { PoolClient } from "pg";
 
 export type SafetyReportReason = "SAFETY_CONCERN" | "HARASSMENT" | "MISREPRESENTATION" | "OTHER";
@@ -190,5 +191,56 @@ export async function reviewSafetyReport(input: {
       throw conflict("REPORT_ALREADY_CLOSED", "This report has already been resolved or dismissed.");
     }
     return { reportId: result.rows[0].id, status: result.rows[0].status };
+  });
+}
+
+export type NoShowEvidenceSummary = {
+  requestId: string;
+  outcome: CompletionOutcome;
+  riderConfirmed: boolean;
+  driverConfirmed: boolean;
+  riderName: string;
+  driverName: string;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departedAt: string;
+  expiredAt: string;
+};
+
+/**
+ * Reviewer-facing list of requests whose completion window lapsed unresolved.
+ *
+ * This is a signal for a human, never an automatic penalty. A lapsed
+ * confirmation can mean a no-show, but it can equally mean someone travelled and
+ * never reopened the app. The UI must present it as such.
+ */
+export async function listNoShowEvidence(actor: AuthenticatedActor): Promise<NoShowEvidenceSummary[]> {
+  return inTransaction(async (client) => {
+    await assertSafetyReviewer(client, actor);
+    const result = await client.query<NoShowEvidenceSummary>(
+      `SELECT e.ride_request_id AS "requestId",
+              e.outcome,
+              e.rider_confirmed AS "riderConfirmed",
+              e.driver_confirmed AS "driverConfirmed",
+              rider.display_name AS "riderName",
+              driver.display_name AS "driverName",
+              o.origin_area AS "originArea",
+              o.destination_area AS "destinationArea",
+              to_char(o.trip_date, 'YYYY-MM-DD') AS "tripDate",
+              to_char(e.departed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS "departedAt",
+              to_char(e.expired_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS "expiredAt"
+         FROM trip_no_show_evidence e
+         JOIN ride_requests r ON r.id = e.ride_request_id
+         JOIN trip_occurrences o
+           ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+         JOIN users rider ON rider.id = r.rider_user_id
+         JOIN users driver ON driver.id = o.driver_user_id
+        WHERE e.community_id = $1
+        ORDER BY e.expired_at DESC, e.ride_request_id
+        LIMIT 100`,
+      [actor.communityId],
+    );
+    return result.rows;
   });
 }
