@@ -63,6 +63,15 @@ type ActivityItem = {
   seatCapacity: number | null;
   seatsReserved: number | null;
 };
+type SafetyReport = {
+  reportId: string;
+  reportedUserId: string;
+  reportedName: string;
+  reason: "SAFETY_CONCERN" | "HARASSMENT" | "MISREPRESENTATION" | "OTHER";
+  status: "RECEIVED" | "IN_REVIEW" | "RESOLVED" | "DISMISSED";
+  createdAt: string;
+};
+type ReportDraft = { userId: string; displayName: string; tripOccurrenceId: string };
 
 const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -93,6 +102,10 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [blockedUsers, setBlockedUsers] = useState<{ userId: string; displayName: string }[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [myReports, setMyReports] = useState<SafetyReport[]>([]);
+  const [reportDraft, setReportDraft] = useState<ReportDraft | null>(null);
+  const [reportReason, setReportReason] = useState<SafetyReport["reason"]>("SAFETY_CONCERN");
+  const [reportDetails, setReportDetails] = useState("");
   const [originArea, setOriginArea] = useState("");
   const [destinationArea, setDestinationArea] = useState("");
   const [departureStart, setDepartureStart] = useState("08:00");
@@ -109,18 +122,20 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   const reload = useCallback(async () => {
     setError("");
     try {
-      const [commuteResult, requestResult, tripResult, activityResult, blockResult] = await Promise.all([
+      const [commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult] = await Promise.all([
         role === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
         api<{ requests: RideRequest[] }>("/api/rides"),
         role === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
         api<{ activity: ActivityItem[] }>("/api/activity"),
         api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
+        api<{ reports: SafetyReport[] }>("/api/reports"),
       ]);
       setCommutes(commuteResult.commutes);
       setRequests(requestResult.requests);
       setPublishedTrips(tripResult.trips);
       setActivity(activityResult.activity);
       setBlockedUsers(blockResult.blocks);
+      setMyReports(reportResult.reports);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
     }
@@ -134,13 +149,15 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
       role === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
       api<{ activity: ActivityItem[] }>("/api/activity"),
       api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
-    ]).then(([commuteResult, requestResult, tripResult, activityResult, blockResult]) => {
+      api<{ reports: SafetyReport[] }>("/api/reports"),
+    ]).then(([commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult]) => {
       if (!mounted) return;
       setCommutes(commuteResult.commutes);
       setRequests(requestResult.requests);
       setPublishedTrips(tripResult.trips);
       setActivity(activityResult.activity);
       setBlockedUsers(blockResult.blocks);
+      setMyReports(reportResult.reports);
     }).catch((cause: unknown) => {
       if (mounted) setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
     });
@@ -283,6 +300,25 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     }
   }
 
+  async function submitReport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!reportDraft) return;
+    await perform(async () => {
+      await api("/api/reports", {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey() },
+        body: JSON.stringify({
+          reportedUserId: reportDraft.userId,
+          tripOccurrenceId: reportDraft.tripOccurrenceId,
+          reason: reportReason,
+          details: reportDetails,
+        }),
+      });
+      setReportDraft(null);
+      setReportDetails("");
+    }, "Report submitted. It is not an emergency service; no alert is sent automatically.");
+  }
+
   async function switchMode(nextMode: ParticipantRole) {
     if (nextMode === role) return;
     setBusy(true);
@@ -331,9 +367,24 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
               <strong>{item.kind === "TRIP" ? "You offered a ride" : item.role === "DRIVER" ? "A rider requested a seat" : "You requested a ride"}: {item.originArea} → {item.destinationArea}</strong>
               <p>{item.tripDate} at {item.departureTime} · {item.status.toLowerCase()}{item.otherParticipantName ? ` · ${item.role === "DRIVER" ? "Rider" : "Driver"}: ${item.otherParticipantName}` : ""}{item.kind === "TRIP" && item.seatCapacity !== null ? ` · ${item.seatsReserved}/${item.seatCapacity} seats reserved` : ""}</p>
             </div>
-            {item.otherParticipantId && !blockedUsers.some((user) => user.userId === item.otherParticipantId) && <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(item.otherParticipantId!, item.otherParticipantName ?? "this user", true)}>Block</button>}
+            {item.otherParticipantId && <div className={styles.inline}>
+              <button className={styles.secondary} disabled={busy} onClick={() => { setReportDraft({ userId: item.otherParticipantId!, displayName: item.otherParticipantName ?? "participant", tripOccurrenceId: item.tripOccurrenceId }); setReportDetails(""); }}>Report</button>
+              {!blockedUsers.some((user) => user.userId === item.otherParticipantId) && <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(item.otherParticipantId!, item.otherParticipantName ?? "this user", true)}>Block</button>}
+            </div>}
           </div>
         ))}
+        {reportDraft && <form className={styles.form} onSubmit={submitReport}>
+          <h3>Report {reportDraft.displayName}</h3>
+          <p className={styles.muted}>Reports are stored for an assigned reviewer. They do not send an alert or provide emergency help.</p>
+          <label>Reason<select required value={reportReason} onChange={(event) => setReportReason(event.target.value as SafetyReport["reason"])}><option value="SAFETY_CONCERN">Safety concern</option><option value="HARASSMENT">Harassment</option><option value="MISREPRESENTATION">Misrepresentation</option><option value="OTHER">Other</option></select></label>
+          <label>What happened?<textarea required minLength={1} maxLength={2000} rows={4} value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} /></label>
+          <div className={styles.inline}><button disabled={busy || reportDetails.trim().length === 0}>Submit report</button><button type="button" className={styles.secondary} disabled={busy} onClick={() => setReportDraft(null)}>Cancel</button></div>
+        </form>}
+      </section>
+
+      <section className={styles.panel}>
+        <h2>Your reports</h2>
+        {myReports.length === 0 ? <p className={styles.muted}>No reports submitted.</p> : myReports.map((report) => <div className={styles.item} key={report.reportId}><div><strong>{report.reportedName} · {report.reason.replaceAll("_", " ").toLowerCase()}</strong><p>{new Date(report.createdAt).toLocaleString()} · {report.status.replaceAll("_", " ").toLowerCase()}</p></div></div>)}
       </section>
 
       <section className={styles.panel}>

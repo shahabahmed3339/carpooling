@@ -24,3 +24,7 @@ export function conflict(code: string, message: string): RideDomainError {
 export function forbidden(): RideDomainError {
   return new RideDomainError("RIDE_ACTION_NOT_ALLOWED", 403, "You cannot perform this action.");
 }
+
+export function rateLimited(code: string, message: string): RideDomainError {
+  return new RideDomainError(code, 429, message);
+}
