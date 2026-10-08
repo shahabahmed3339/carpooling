@@ -7,6 +7,7 @@ export type ParticipantRole = "RIDER" | "DRIVER";
 
 export type AuthenticatedActor = {
   userId: string;
+  email: string;
   /** Internal marketplace tenant. It is not a user-selected community. */
   communityId: string;
   participantRole: ParticipantRole;
@@ -101,7 +102,7 @@ export async function getPilotAccessState(signupRole?: ParticipantRole): Promise
       }
       return {
         status: "ACTIVE",
-        actor: { userId: existing.id, communityId: MARKETPLACE_ID, participantRole: existing.participant_role },
+        actor: { userId: existing.id, email, communityId: MARKETPLACE_ID, participantRole: existing.participant_role },
       };
     }
 
@@ -120,7 +121,7 @@ export async function getPilotAccessState(signupRole?: ParticipantRole): Promise
     );
     return {
       status: "ACTIVE",
-      actor: { userId, communityId: MARKETPLACE_ID, participantRole },
+      actor: { userId, email, communityId: MARKETPLACE_ID, participantRole },
     };
   });
 }

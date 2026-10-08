@@ -2,7 +2,9 @@
 .header { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .kicker { margin: 0 0 7px; color: #5d8066; font-size: 10px; font-weight: 750; letter-spacing: .13em; }
 .header h1 { margin: 0; font-size: clamp(28px, 5vw, 38px); letter-spacing: -.05em; }
+.accountIdentity { margin: 7px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .headerActions, .inline { display: flex; align-items: center; gap: 9px; }
+.inlineMessage { color: #8a5a21; font-size: 11px; line-height: 1.4; }
 .modeSwitch { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: #f6f9f6; }
 .modeSwitch button { min-height: 32px; padding: 0 10px; border: 0; border-radius: 7px; color: #526259; background: transparent; font: inherit; font-size: 11px; font-weight: 650; cursor: pointer; }
 .modeSwitch button[aria-pressed="true"] { color: #fff; background: var(--green); }
@@ -26,6 +28,7 @@
 .item p { margin: 5px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .item input[type="date"] { min-height: 37px; padding: 0 8px; border: 1px solid #dbe4dd; border-radius: 7px; color: var(--ink); font: inherit; font-size: 12px; }
 .secondary { border: 1px solid #d9e5dc !important; color: #3b654a !important; background: #fff !important; }
+.danger { border: 1px solid #f0d0cc !important; color: #8a302c !important; background: #fff7f6 !important; }
 .muted { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .error, .notice { padding: 11px 13px; border-radius: 8px; font-size: 12px; line-height: 1.5; }
 .error { color: #8a302c; background: #fff1ef; }

@@ -1,5 +1,9 @@
-import { createTripOccurrence } from "@/server/rides/requests";
+import { createTripOccurrence, listOwnTripOccurrences } from "@/server/rides/requests";
 import { jsonResult, readJsonObject, requiredString, requireIdempotencyKey, requireUuid, withActor } from "@/server/http/responses";
+
+export async function GET(): Promise<Response> {
+  return withActor(async (actor) => Response.json({ trips: await listOwnTripOccurrences(actor) }));
+}
 
 export async function POST(request: Request): Promise<Response> {
   return withActor(async (actor) => {

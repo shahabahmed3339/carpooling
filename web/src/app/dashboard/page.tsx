@@ -11,5 +11,5 @@ async function DashboardContent() {
   const access = await getPilotAccessState();
   if (access.status === "AUTH_DISABLED" || access.status === "SIGNED_OUT") redirect("/login");
   if (access.status !== "ACTIVE") redirect("/auth/complete");
-  return <DashboardClient initialMode={access.actor.participantRole} />;
+  return <DashboardClient initialMode={access.actor.participantRole} accountEmail={access.actor.email} />;
 }

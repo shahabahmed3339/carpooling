@@ -6,6 +6,7 @@ import { assertActiveCommunityMember, assertParticipantRole } from "@/server/com
 import { isValidDateOnly } from "@/domain/clock";
 import { conflict, forbidden, invalid, notFound } from "./errors";
 import type { AuthenticatedActor } from "@/server/auth/actor";
+import { lockUserPair } from "@/server/users/blocks";
 
 type RequestResult = {
   requestId: string;
@@ -25,6 +26,7 @@ async function usersAreBlocked(
   firstUserId: string,
   secondUserId: string,
 ): Promise<boolean> {
+  await lockUserPair(client, firstUserId, secondUserId);
   const result = await client.query(
     `SELECT 1
        FROM user_blocks
@@ -173,7 +175,8 @@ export async function createTripOccurrence(input: {
                ON m.community_id = t.community_id AND m.user_id = t.owner_user_id
             WHERE t.id = $1
               AND t.community_id = $2
-              AND t.owner_user_id = $3`,
+              AND t.owner_user_id = $3
+            FOR UPDATE OF t`,
           [input.commuteTemplateId, input.actor.communityId, input.actor.userId],
         );
         const template = templateResult.rows[0];
@@ -256,6 +259,100 @@ export async function createTripOccurrence(input: {
           "COMMUTE_NOT_SCHEDULED",
           "The commute is not active for that date or its departure has passed.",
         );
+      },
+    }),
+  );
+}
+
+export type CancelTripResult = {
+  tripOccurrenceId: string;
+  status: "CANCELLED";
+  requestsWithdrawn: number;
+  replayedOrExisting?: boolean;
+};
+
+/** Driver cancels a dated trip and withdraws its pending/accepted requests atomically. */
+export async function cancelTripOccurrence(input: {
+  actor: AuthenticatedActor;
+  tripOccurrenceId: string;
+  idempotencyKey: string;
+}): Promise<IdempotentResult<CancelTripResult>> {
+  assertParticipantRole(input.actor.participantRole, "DRIVER");
+  return inTransaction(async (client) =>
+    withIdempotency<CancelTripResult>({
+      client,
+      actorUserId: input.actor.userId,
+      operation: "trip-occurrence.cancel",
+      key: input.idempotencyKey,
+      requestFingerprint: JSON.stringify({
+        communityId: input.actor.communityId,
+        tripOccurrenceId: input.tripOccurrenceId,
+      }),
+      work: async () => {
+        const tripResult = await client.query<{
+          id: string;
+          driver_user_id: string;
+          status: OccurrenceResult["status"];
+          departure_at: Date;
+          seats_reserved: number;
+        }>(
+          `SELECT id, driver_user_id, status, departure_at, seats_reserved
+             FROM trip_occurrences
+            WHERE id = $1 AND community_id = $2
+            FOR UPDATE`,
+          [input.tripOccurrenceId, input.actor.communityId],
+        );
+        const trip = tripResult.rows[0];
+        if (!trip || trip.driver_user_id !== input.actor.userId) throw notFound();
+        await assertActiveCommunityMember(client, input.actor.communityId, input.actor.userId);
+
+        if (trip.status === "CANCELLED") {
+          return {
+            status: 200,
+            body: { tripOccurrenceId: trip.id, status: "CANCELLED", requestsWithdrawn: 0, replayedOrExisting: true },
+          };
+        }
+        if (trip.status !== "OPEN" || trip.departure_at <= new Date()) {
+          throw conflict("TRIP_NOT_CANCELLABLE", "A trip can only be cancelled before it departs.");
+        }
+
+        const activeRequests = await client.query<{ id: string; status: "REQUESTED" | "ACCEPTED" }>(
+          `SELECT id, status
+             FROM ride_requests
+            WHERE trip_occurrence_id = $1
+              AND community_id = $2
+              AND status IN ('REQUESTED', 'ACCEPTED')
+            ORDER BY id
+            FOR UPDATE`,
+          [trip.id, input.actor.communityId],
+        );
+        const updatedRequests = await client.query(
+          `UPDATE ride_requests
+              SET status = 'CANCELLED', updated_at = now()
+            WHERE trip_occurrence_id = $1
+              AND community_id = $2
+              AND status IN ('REQUESTED', 'ACCEPTED')`,
+          [trip.id, input.actor.communityId],
+        );
+        const cancelled = await client.query(
+          `UPDATE trip_occurrences
+              SET status = 'CANCELLED', seats_reserved = 0, updated_at = now()
+            WHERE id = $1 AND community_id = $2 AND status = 'OPEN'
+            RETURNING id`,
+          [trip.id, input.actor.communityId],
+        );
+        if (cancelled.rowCount !== 1) {
+          throw conflict("TRIP_NOT_CANCELLABLE", "This trip changed. Refresh and try again.");
+        }
+
+        return {
+          status: 200,
+          body: {
+            tripOccurrenceId: trip.id,
+            status: "CANCELLED",
+            requestsWithdrawn: updatedRequests.rowCount ?? activeRequests.rowCount ?? 0,
+          },
+        };
       },
     }),
   );
@@ -538,12 +635,122 @@ export type RideRequestSummary = {
   requestId: string;
   tripOccurrenceId: string;
   status: "REQUESTED" | "ACCEPTED" | "REJECTED" | "CANCELLED" | "EXPIRED" | "COMPLETED" | "DISPUTED";
+  otherParticipantId: string;
   otherParticipantName: string;
   originArea: string;
   destinationArea: string;
   tripDate: string;
   departureTime: string;
 };
+
+export type DriverTripSummary = {
+  tripOccurrenceId: string;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departureTime: string;
+  seatCapacity: number;
+  seatsReserved: number;
+  status: "OPEN" | "CANCELLED" | "COMPLETED";
+  canCancel: boolean;
+};
+
+export type AccountActivityItem = {
+  kind: "TRIP" | "REQUEST";
+  recordId: string;
+  tripOccurrenceId: string;
+  role: "DRIVER" | "RIDER";
+  status: "OPEN" | "CANCELLED" | "COMPLETED" | RideRequestSummary["status"];
+  otherParticipantId: string | null;
+  otherParticipantName: string | null;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departureTime: string;
+  seatCapacity: number | null;
+  seatsReserved: number | null;
+};
+
+export async function listAccountActivity(actor: AuthenticatedActor): Promise<AccountActivityItem[]> {
+  return inTransaction(async (client) => {
+    await assertActiveCommunityMember(client, actor.communityId, actor.userId);
+    const result = await client.query<AccountActivityItem>(
+      `SELECT *
+         FROM (
+           SELECT 'TRIP'::text AS kind,
+                  o.id AS "recordId",
+                  o.id AS "tripOccurrenceId",
+                  'DRIVER'::text AS role,
+                  o.status::text AS status,
+                  NULL::uuid AS "otherParticipantId",
+                  NULL::text AS "otherParticipantName",
+                  o.origin_area AS "originArea",
+                  o.destination_area AS "destinationArea",
+                  to_char(o.trip_date, 'YYYY-MM-DD') AS "tripDate",
+                  to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS "departureTime",
+                  o.seat_capacity AS "seatCapacity",
+                  o.seats_reserved AS "seatsReserved",
+                  o.departure_at AS sort_time
+             FROM trip_occurrences o
+            WHERE o.community_id = $1 AND o.driver_user_id = $2
+
+           UNION ALL
+
+           SELECT 'REQUEST'::text AS kind,
+                  r.id AS "recordId",
+                  o.id AS "tripOccurrenceId",
+                  CASE WHEN o.driver_user_id = $2 THEN 'DRIVER' ELSE 'RIDER' END AS role,
+                  r.status::text AS status,
+                  other.id AS "otherParticipantId",
+                  other.display_name AS "otherParticipantName",
+                  o.origin_area AS "originArea",
+                  o.destination_area AS "destinationArea",
+                  to_char(o.trip_date, 'YYYY-MM-DD') AS "tripDate",
+                  to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS "departureTime",
+                  NULL::smallint AS "seatCapacity",
+                  NULL::smallint AS "seatsReserved",
+                  o.departure_at AS sort_time
+             FROM ride_requests r
+             JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+             JOIN users other ON other.id = CASE
+               WHEN o.driver_user_id = $2 THEN r.rider_user_id
+               ELSE o.driver_user_id
+             END
+            WHERE r.community_id = $1
+              AND (o.driver_user_id = $2 OR r.rider_user_id = $2)
+         ) activity
+        ORDER BY sort_time DESC, "recordId" DESC
+        LIMIT 100`,
+      [actor.communityId, actor.userId],
+    );
+    return result.rows;
+  });
+}
+
+export async function listOwnTripOccurrences(actor: AuthenticatedActor): Promise<DriverTripSummary[]> {
+  return inTransaction(async (client) => {
+    await assertActiveCommunityMember(client, actor.communityId, actor.userId);
+    const result = await client.query<DriverTripSummary>(
+      `SELECT id AS "tripOccurrenceId",
+              origin_area AS "originArea",
+              destination_area AS "destinationArea",
+              to_char(trip_date, 'YYYY-MM-DD') AS "tripDate",
+              to_char(departure_at AT TIME ZONE timezone, 'HH24:MI') AS "departureTime",
+              seat_capacity AS "seatCapacity",
+              seats_reserved AS "seatsReserved",
+              status,
+              (status = 'OPEN' AND departure_at > now()) AS "canCancel"
+         FROM trip_occurrences
+        WHERE community_id = $1
+          AND driver_user_id = $2
+          AND trip_date >= current_date
+        ORDER BY departure_at ASC, id ASC
+        LIMIT 50`,
+      [actor.communityId, actor.userId],
+    );
+    return result.rows;
+  });
+}
 
 export async function listRideRequests(actor: AuthenticatedActor): Promise<RideRequestSummary[]> {
   return inTransaction(async (client) => {
@@ -552,6 +759,7 @@ export async function listRideRequests(actor: AuthenticatedActor): Promise<RideR
       `SELECT r.id AS "requestId",
               o.id AS "tripOccurrenceId",
               r.status,
+              other.id AS "otherParticipantId",
               other.display_name AS "otherParticipantName",
               o.origin_area AS "originArea",
               o.destination_area AS "destinationArea",

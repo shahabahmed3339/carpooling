@@ -27,8 +27,8 @@ export type CommuteTemplateRecord = CommuteTemplateInput & {
 };
 
 function normalizeInput(input: CommuteTemplateInput): CommuteTemplateInput {
-  const originArea = input.originArea.trim();
-  const destinationArea = input.destinationArea.trim();
+  const originArea = input.originArea.trim().replace(/\s+/gu, " ");
+  const destinationArea = input.destinationArea.trim().replace(/\s+/gu, " ");
   const start = parseClockMinutes(input.departureWindowStart);
   const end = parseClockMinutes(input.departureWindowEnd);
 

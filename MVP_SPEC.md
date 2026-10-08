@@ -9,7 +9,7 @@ Let any person create one email-verified account and use it as a Rider, a Driver
 - **Account:** one identity associated with a verified email.
 - **Mode:** currently selected dashboard/action context (`RIDER` or `DRIVER`). It can change at any time.
 - **Commute:** a reusable description of a driver's usual route/schedule.
-- **Dated trip:** an actual offer to travel on one date, derived from a commute or otherwise published.
+- **Dated trip:** an actual offer to travel on one date, derived from a commute or otherwise published. The selected usual weekdays restrict which dates can be published; they do not auto-publish trips.
 - **Seat request:** a rider's request to join a dated trip. It is not accepted until the driver accepts it.
 - **Internal marketplace scope:** database tenant used for existing data isolation. It is automatic and invisible to users; it is not a community signup requirement.
 
@@ -18,11 +18,15 @@ Let any person create one email-verified account and use it as a Rider, a Driver
 1. **Open signup/sign-in:** name + email + one-time verification link. No invitation, community selection, operator review, or organization membership gate.
 2. **Starting mode:** signup may choose Rider or Driver to select the first dashboard view.
 3. **Mode switch:** a visible toggle in the dashboard updates the stored preference. Verify eligibility and ownership on every API request.
-4. **Driver:** create/list/update commute templates; publish specific dated trips; list and accept/decline rider requests.
+4. **Driver:** create/list/update commute templates from the dashboard; publish specific dated trips; list and accept/decline rider requests.
 5. **Rider:** search open dated trips; request a seat; list/cancel own requests.
 6. **One identity:** a user may hold records from both modes. Switching the current mode must not mutate/delete trip or request ownership.
-7. **Trip state:** validate transitions and capacity transactionally; use idempotency keys for mutating requests; repeated submission must not duplicate effects.
-8. **Privacy:** search returns approximate trip areas and only necessary participant display information. Do not expose private contact details without a valid coordination need.
+7. **Cross-mode activity:** show the account's own trips and requests in a shared activity list in either mode; keep role-specific actions in their corresponding dashboard views.
+8. **Trip state:** validate transitions and capacity transactionally; use idempotency keys for mutating requests; repeated submission must not duplicate effects.
+9. **Driver cancellation:** before departure, the driver can cancel a published trip. Pending and accepted requests are withdrawn in the same transaction, and the trip is removed from search.
+10. **Privacy:** search returns approximate trip areas and only necessary participant display information. Do not expose private contact details without a valid coordination need.
+11. **Area matching:** compare trimmed area names case-insensitively and collapse repeated whitespace. Do not infer that different neighborhood names are nearby or equivalent.
+12. **Blocking:** users can block/unblock another participant. A block suppresses future matches and prevents a new request from being created or accepted; it does not automatically cancel an existing accepted trip.
 
 ## Non-goals for the first slice
 

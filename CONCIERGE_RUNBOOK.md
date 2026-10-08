@@ -22,6 +22,7 @@ This describes the current product workflow. There is no manual community enroll
 2. Publish a specific date when actually offering seats; a commute template alone is not a confirmed trip.
 3. Review incoming requests and accept/decline them.
 4. Do not exceed offered capacity. Accepted requests reserve seats transactionally.
+5. A driver may cancel a future trip. The app withdraws its pending and accepted seat requests and removes the trip from search. Users must check their dashboard for the updated status; automated notifications are not implemented.
 
 ## Switching modes
 

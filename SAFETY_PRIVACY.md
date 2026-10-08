@@ -22,6 +22,8 @@
 
 Name a support contact and realistic support hours. Publish clear rules for requests, acceptance, cancellation, no-shows, cost sharing, and disputes. Provide a way to block another user and submit a report. Define who reviews a report, how urgent reports are escalated, when accounts/trips are suspended, how evidence is handled, and how decisions are recorded.
 
+The current block control removes a participant from future matching and prevents a pending request from being newly accepted. Blocking does not automatically cancel existing requests or accepted trips. Direct users to visible trip/request controls and the published support route when they need help; do not present blocking as emergency response or a guarantee of separation in every context.
+
 Tell users plainly that the app is not an emergency service and does not continuously monitor rides. Provide the appropriate local emergency guidance only after it has been checked. Obtain qualified local review for legal, insurance, transport, privacy, and any other obligations that apply before facilitating real rides.
 
 ## Incident principle

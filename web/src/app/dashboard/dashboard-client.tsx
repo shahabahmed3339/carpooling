@@ -14,9 +14,11 @@ type Commute = {
   weekdays: number[];
   seatsOffered: number;
   isActive: boolean;
+  version: number;
 };
 type Candidate = {
   tripOccurrenceId: string;
+  memberId: string;
   displayName: string;
   originArea: string;
   destinationArea: string;
@@ -28,14 +30,49 @@ type RideRequest = {
   requestId: string;
   tripOccurrenceId: string;
   status: string;
+  otherParticipantId: string;
   otherParticipantName: string;
   originArea: string;
   destinationArea: string;
   tripDate: string;
   departureTime: string;
 };
+type DriverTrip = {
+  tripOccurrenceId: string;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departureTime: string;
+  seatCapacity: number;
+  seatsReserved: number;
+  status: "OPEN" | "CANCELLED" | "COMPLETED";
+  canCancel: boolean;
+};
+type ActivityItem = {
+  kind: "TRIP" | "REQUEST";
+  recordId: string;
+  tripOccurrenceId: string;
+  role: ParticipantRole;
+  status: string;
+  otherParticipantId: string | null;
+  otherParticipantName: string | null;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departureTime: string;
+  seatCapacity: number | null;
+  seatsReserved: number | null;
+};
 
 const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function weekdayForDate(date: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+  const [year, month, day] = date.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) return null;
+  return parsed.getUTCDay();
+}
 
 function idempotencyKey(): string {
   return crypto.randomUUID();
@@ -48,10 +85,13 @@ async function api<T>(url: string, init?: RequestInit): Promise<T> {
   return payload;
 }
 
-export default function DashboardClient({ initialMode }: { initialMode: ParticipantRole }) {
+export default function DashboardClient({ initialMode, accountEmail }: { initialMode: ParticipantRole; accountEmail: string }) {
   const [role, setRole] = useState<ParticipantRole>(initialMode);
   const [commutes, setCommutes] = useState<Commute[]>([]);
   const [requests, setRequests] = useState<RideRequest[]>([]);
+  const [publishedTrips, setPublishedTrips] = useState<DriverTrip[]>([]);
+  const [activity, setActivity] = useState<ActivityItem[]>([]);
+  const [blockedUsers, setBlockedUsers] = useState<{ userId: string; displayName: string }[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [originArea, setOriginArea] = useState("");
   const [destinationArea, setDestinationArea] = useState("");
@@ -61,6 +101,7 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
   const [tripDate, setTripDate] = useState("");
   const [selectedDays, setSelectedDays] = useState<number[]>([1, 2, 3, 4, 5]);
   const [seats, setSeats] = useState(1);
+  const [editingCommute, setEditingCommute] = useState<{ id: string; version: number } | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -68,12 +109,18 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
   const reload = useCallback(async () => {
     setError("");
     try {
-      const [commuteResult, requestResult] = await Promise.all([
+      const [commuteResult, requestResult, tripResult, activityResult, blockResult] = await Promise.all([
         role === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
         api<{ requests: RideRequest[] }>("/api/rides"),
+        role === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
+        api<{ activity: ActivityItem[] }>("/api/activity"),
+        api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
       ]);
       setCommutes(commuteResult.commutes);
       setRequests(requestResult.requests);
+      setPublishedTrips(tripResult.trips);
+      setActivity(activityResult.activity);
+      setBlockedUsers(blockResult.blocks);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
     }
@@ -84,10 +131,16 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
     Promise.all([
       role === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
       api<{ requests: RideRequest[] }>("/api/rides"),
-    ]).then(([commuteResult, requestResult]) => {
+      role === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
+      api<{ activity: ActivityItem[] }>("/api/activity"),
+      api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
+    ]).then(([commuteResult, requestResult, tripResult, activityResult, blockResult]) => {
       if (!mounted) return;
       setCommutes(commuteResult.commutes);
       setRequests(requestResult.requests);
+      setPublishedTrips(tripResult.trips);
+      setActivity(activityResult.activity);
+      setBlockedUsers(blockResult.blocks);
     }).catch((cause: unknown) => {
       if (mounted) setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
     });
@@ -109,11 +162,11 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
     }
   }
 
-  async function addCommute(event: FormEvent<HTMLFormElement>) {
+  async function saveCommute(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     await perform(async () => {
-      await api("/api/commutes", {
-        method: "POST",
+      await api(editingCommute ? `/api/commutes/${editingCommute.id}` : "/api/commutes", {
+        method: editingCommute ? "PATCH" : "POST",
         headers: { "Idempotency-Key": idempotencyKey() },
         body: JSON.stringify({
           originArea,
@@ -123,9 +176,32 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
           weekdays: selectedDays,
           role: "OFFERING",
           seatsOffered: seats,
+          ...(editingCommute ? { expectedVersion: editingCommute.version } : {}),
         }),
       });
-    }, "Commute saved.");
+      stopEditingCommute();
+    }, editingCommute ? "Commute updated. Existing published trips are unchanged." : "Commute saved.");
+  }
+
+  function beginEditCommute(commute: Commute) {
+    setEditingCommute({ id: commute.id, version: commute.version });
+    setOriginArea(commute.originArea);
+    setDestinationArea(commute.destinationArea);
+    setDepartureStart(commute.departureWindowStart);
+    setDepartureEnd(commute.departureWindowEnd);
+    setSelectedDays(commute.weekdays);
+    setSeats(commute.seatsOffered);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+  function stopEditingCommute() {
+    setEditingCommute(null);
+    setOriginArea("");
+    setDestinationArea("");
+    setDepartureStart("08:00");
+    setDepartureEnd("08:20");
+    setSelectedDays([1, 2, 3, 4, 5]);
+    setSeats(1);
   }
 
   async function publishTrip(commuteId: string, date: string) {
@@ -136,6 +212,17 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
         body: JSON.stringify({ commuteTemplateId: commuteId, tripDate: date }),
       });
     }, "Dated trip published.");
+  }
+
+  async function cancelTrip(trip: DriverTrip) {
+    const confirmed = window.confirm("Cancel this trip? Pending and accepted seat requests will also be withdrawn.");
+    if (!confirmed) return;
+    await perform(async () => {
+      await api(`/api/trips/${trip.tripOccurrenceId}`, {
+        method: "DELETE",
+        headers: { "Idempotency-Key": idempotencyKey() },
+      });
+    }, "Trip cancelled. Active seat requests were withdrawn.");
   }
 
   async function search(event: FormEvent<HTMLFormElement>) {
@@ -176,6 +263,26 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
     }, action === "accept" ? "Seat request accepted." : action === "reject" ? "Seat request declined." : "Your request was cancelled.");
   }
 
+  async function setUserBlocked(userId: string, displayName: string, blocked: boolean) {
+    if (blocked && !window.confirm(`Block ${displayName}? They will no longer appear in future matches, but existing trips and requests will remain.`)) return;
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await api(`/api/users/${userId}/block`, { method: blocked ? "POST" : "DELETE" });
+      setBlockedUsers((current) => blocked
+        ? current.some((user) => user.userId === userId) ? current : [...current, { userId, displayName }]
+        : current.filter((user) => user.userId !== userId));
+      if (blocked) setCandidates((current) => current.filter((candidate) => candidate.memberId !== userId));
+      setNotice(blocked ? `${displayName} was blocked.` : `${displayName} was unblocked.`);
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update blocked users.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function switchMode(nextMode: ParticipantRole) {
     if (nextMode === role) return;
     setBusy(true);
@@ -202,7 +309,7 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
   return (
     <main className={styles.page}>
       <header className={styles.header}>
-        <div><p className={styles.kicker}>CARPOOL PAKISTAN</p><h1>{role === "RIDER" ? "Find a ride" : "Offer a ride"}</h1></div>
+        <div><p className={styles.kicker}>CARPOOL PAKISTAN</p><h1>{role === "RIDER" ? "Find a ride" : "Offer a ride"}</h1><p className={styles.accountIdentity}>Signed in as {accountEmail}</p></div>
         <div className={styles.headerActions}>
           <div className={styles.modeSwitch} aria-label="Dashboard mode">
             <button aria-pressed={role === "RIDER"} disabled={busy} onClick={() => void switchMode("RIDER")}>Rider</button>
@@ -215,27 +322,70 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
       {error && <p className={styles.error} role="alert">{error}</p>}
       {notice && <p className={styles.notice} role="status">{notice}</p>}
 
+      <section className={styles.panel}>
+        <h2>Your activity</h2>
+        <p className={styles.muted}>Trips and requests from both Rider and Driver modes.</p>
+        {activity.length === 0 ? <p className={styles.muted}>No trips or requests yet.</p> : activity.map((item) => (
+          <div className={styles.item} key={`${item.kind}-${item.recordId}`}>
+            <div>
+              <strong>{item.kind === "TRIP" ? "You offered a ride" : item.role === "DRIVER" ? "A rider requested a seat" : "You requested a ride"}: {item.originArea} → {item.destinationArea}</strong>
+              <p>{item.tripDate} at {item.departureTime} · {item.status.toLowerCase()}{item.otherParticipantName ? ` · ${item.role === "DRIVER" ? "Rider" : "Driver"}: ${item.otherParticipantName}` : ""}{item.kind === "TRIP" && item.seatCapacity !== null ? ` · ${item.seatsReserved}/${item.seatCapacity} seats reserved` : ""}</p>
+            </div>
+            {item.otherParticipantId && !blockedUsers.some((user) => user.userId === item.otherParticipantId) && <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(item.otherParticipantId!, item.otherParticipantName ?? "this user", true)}>Block</button>}
+          </div>
+        ))}
+      </section>
+
+      <section className={styles.panel}>
+        <h2>Blocked users</h2>
+        {blockedUsers.length === 0 ? <p className={styles.muted}>You haven’t blocked anyone.</p> : blockedUsers.map((user) => (
+          <div className={styles.item} key={user.userId}>
+            <strong>{user.displayName}</strong>
+            <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(user.userId, user.displayName, false)}>Unblock</button>
+          </div>
+        ))}
+      </section>
+
       {role === "DRIVER" ? (
         <>
           <section className={styles.panel}>
-            <h2>Add a regular commute</h2>
-            <p className={styles.muted}>Riders search the exact pickup and destination areas you enter and the date you publish.</p>
-            <form className={styles.form} onSubmit={addCommute}>
+            <h2>{editingCommute ? "Edit your regular commute" : "Add a regular commute"}</h2>
+            <p className={styles.muted}>Changes apply to dates you publish in the future. Already published trips keep their current details.</p>
+            <p className={styles.muted}>Riders search these pickup and destination areas. Capitalization and extra spaces are ignored; neighborhood names must still match.</p>
+            <form className={styles.form} onSubmit={saveCommute}>
               <label>Pickup area<input required maxLength={120} value={originArea} onChange={(event) => setOriginArea(event.target.value)} placeholder="e.g. Gulberg" /></label>
               <label>Destination area<input required maxLength={120} value={destinationArea} onChange={(event) => setDestinationArea(event.target.value)} placeholder="e.g. DHA Phase 5" /></label>
               <label>Departure from<input required type="time" value={departureStart} onChange={(event) => setDepartureStart(event.target.value)} /></label>
               <label>Departure until<input required type="time" value={departureEnd} onChange={(event) => setDepartureEnd(event.target.value)} /></label>
               <fieldset><legend>Days you usually travel</legend><div className={styles.days}>{weekdays.map((day, index) => <label key={day}><input type="checkbox" checked={selectedDays.includes(index)} onChange={() => toggleDay(index)} />{day}</label>)}</div></fieldset>
               <label>Seats to offer<input required min={1} max={8} type="number" value={seats} onChange={(event) => setSeats(Number(event.target.value))} /></label>
-              <button disabled={busy || selectedDays.length === 0}>Save commute</button>
+              <div className={styles.inline}>
+                <button disabled={busy || selectedDays.length === 0}>{editingCommute ? "Save changes" : "Save commute"}</button>
+                {editingCommute && <button className={styles.secondary} disabled={busy} type="button" onClick={stopEditingCommute}>Stop editing</button>}
+              </div>
             </form>
           </section>
           <section className={styles.panel}>
             <h2>Publish a dated trip</h2>
+            <p className={styles.muted}>Your usual travel days only limit which dates are available. They do not publish trips automatically; publish each date you are offering a seat.</p>
             {commutes.length === 0 ? <p className={styles.muted}>Save a commute first. You can then publish a particular future date.</p> : commutes.map((commute) => (
               <div className={styles.item} key={commute.id}>
-                <div><strong>{commute.originArea} → {commute.destinationArea}</strong><p>{commute.departureWindowStart} · {commute.seatsOffered} seat(s)</p></div>
-                <div className={styles.inline}><input aria-label="Trip date" min={new Date().toLocaleDateString("en-CA")} type="date" value={tripDate} onChange={(event) => setTripDate(event.target.value)} /><button disabled={busy || !tripDate} onClick={() => void publishTrip(commute.id, tripDate)}>Publish date</button></div>
+                <div><strong>{commute.originArea} → {commute.destinationArea}</strong><p>{commute.departureWindowStart} · {commute.seatsOffered} seat(s) · Usually: {commute.weekdays.map((day) => weekdays[day]).join(", ")}</p></div>
+                <div className={styles.inline}>
+                  <button className={styles.secondary} disabled={busy} type="button" onClick={() => beginEditCommute(commute)}>Edit commute</button>
+                  <input aria-label="Trip date" min={new Date().toLocaleDateString("en-CA")} type="date" value={tripDate} onChange={(event) => setTripDate(event.target.value)} />
+                  <button disabled={busy || !tripDate || !commute.weekdays.includes(weekdayForDate(tripDate) ?? -1)} onClick={() => void publishTrip(commute.id, tripDate)}>Publish date</button>
+                  {tripDate && !commute.weekdays.includes(weekdayForDate(tripDate) ?? -1) && <span className={styles.inlineMessage}>Choose one of this commute’s usual travel days.</span>}
+                </div>
+              </div>
+            ))}
+          </section>
+          <section className={styles.panel}>
+            <h2>Your published trips</h2>
+            {publishedTrips.length === 0 ? <p className={styles.muted}>No upcoming trips published yet.</p> : publishedTrips.map((trip) => (
+              <div className={styles.item} key={trip.tripOccurrenceId}>
+                <div><strong>{trip.originArea} → {trip.destinationArea}</strong><p>{trip.tripDate} at {trip.departureTime} · {trip.status.toLowerCase()} · {trip.seatsReserved}/{trip.seatCapacity} seats requested</p></div>
+                {trip.canCancel && <button className={styles.danger} disabled={busy} onClick={() => void cancelTrip(trip)}>Cancel trip</button>}
               </div>
             ))}
           </section>
@@ -248,7 +398,7 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
         <>
           <section className={styles.panel}>
             <h2>Search a dated trip</h2>
-            <p className={styles.muted}>Search with the pickup and destination areas the driver listed and choose a published date.</p>
+            <p className={styles.muted}>Enter the same pickup and destination area names as the driver. Capitalization and extra spaces are ignored; nearby neighborhood names are not.</p>
             <form className={styles.form} onSubmit={search}>
               <label>Pickup area<input required maxLength={120} value={originArea} onChange={(event) => setOriginArea(event.target.value)} placeholder="e.g. Gulberg" /></label>
               <label>Destination area<input required maxLength={120} value={destinationArea} onChange={(event) => setDestinationArea(event.target.value)} placeholder="e.g. DHA Phase 5" /></label>
@@ -262,7 +412,10 @@ export default function DashboardClient({ initialMode }: { initialMode: Particip
             {candidates.length === 0 ? <p className={styles.muted}>Search to see available trips.</p> : candidates.map((candidate) => (
               <div className={styles.item} key={candidate.tripOccurrenceId}>
                 <div><strong>{candidate.originArea} → {candidate.destinationArea}</strong><p>{candidate.displayName} · {candidate.departureTime} · {candidate.availableSeats} seat(s)</p></div>
-                <button disabled={busy || requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status))} onClick={() => void requestSeat(candidate)}>{requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status)) ? "Already requested" : "Request seat"}</button>
+                <div className={styles.inline}>
+                  <button disabled={busy || requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status))} onClick={() => void requestSeat(candidate)}>{requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status)) ? "Already requested" : "Request seat"}</button>
+                  <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(candidate.memberId, candidate.displayName, true)}>Block</button>
+                </div>
               </div>
             ))}
           </section>

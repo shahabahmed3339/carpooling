@@ -33,9 +33,12 @@ export async function searchRideCandidates(input: {
     throw invalid("INVALID_DEPARTURE_TIME", "Departure time must use valid 24-hour HH:mm format.");
   }
 
-  const originArea = input.originArea.trim();
-  const destinationArea = input.destinationArea.trim();
-  if (!originArea || originArea.length > 120 || !destinationArea || destinationArea.length > 120) {
+  const rawOriginArea = input.originArea.trim();
+  const rawDestinationArea = input.destinationArea.trim();
+  const normalizeArea = (value: string) => value.replace(/\s+/gu, " ").toLowerCase();
+  const originArea = normalizeArea(rawOriginArea);
+  const destinationArea = normalizeArea(rawDestinationArea);
+  if (!originArea || rawOriginArea.length > 120 || !destinationArea || rawDestinationArea.length > 120) {
     throw invalid("INVALID_AREA", "Choose valid approximate origin and destination areas.");
   }
   if (
@@ -115,8 +118,8 @@ export async function searchRideCandidates(input: {
           AND t.role IN ('OFFERING', 'EITHER')
           AND t.seats_offered > 0
           AND t.owner_user_id <> s.viewer_id
-          AND t.origin_area = s.origin_area
-          AND t.destination_area = s.destination_area
+          AND lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = s.origin_area
+          AND lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = s.destination_area
           AND abs(candidate.local_departure_minute - s.desired_minute) <= s.tolerance_minutes
           AND NOT EXISTS (
             SELECT 1 FROM user_blocks b
