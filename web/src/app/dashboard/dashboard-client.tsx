@@ -20,6 +20,7 @@ type Commute = {
   departureWindowEnd: string;
   weekdays: number[];
   seatsOffered: number;
+  contributionNote: string | null;
   isActive: boolean;
   version: number;
 };
@@ -32,6 +33,7 @@ type Candidate = {
   departureTime: string;
   availableSeats: number;
   departureDifferenceMinutes: number;
+  contributionNote: string | null;
 };
 type RideRequest = {
   requestId: string;
@@ -45,6 +47,8 @@ type RideRequest = {
   departureTime: string;
   awaitingCompletion: boolean;
   departurePassed: boolean;
+  disputeResolved: boolean;
+  tripStatus: "OPEN" | "CANCELLED" | "COMPLETED";
   riderConfirmedCompletion: boolean;
   driverConfirmedCompletion: boolean;
 };
@@ -58,6 +62,7 @@ type DriverTrip = {
   seatsReserved: number;
   status: "OPEN" | "CANCELLED" | "COMPLETED";
   canCancel: boolean;
+  contributionNote: string | null;
 };
 type ActivityItem = {
   kind: "TRIP" | "REQUEST";
@@ -232,6 +237,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   const [tripDate, setTripDate] = useState("");
   const [selectedDays, setSelectedDays] = useState<number[]>([1, 2, 3, 4, 5]);
   const [seats, setSeats] = useState(1);
+  const [contributionNote, setContributionNote] = useState("");
   const [editingCommute, setEditingCommute] = useState<{ id: string; version: number } | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState("");
@@ -426,6 +432,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           weekdays: selectedDays,
           role: "OFFERING",
           seatsOffered: seats,
+          contributionNote: contributionNote.trim().length === 0 ? null : contributionNote.trim(),
           ...(editingCommute ? { expectedVersion: editingCommute.version } : {}),
         }),
       });
@@ -441,6 +448,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
     setDepartureEnd(commute.departureWindowEnd);
     setSelectedDays(commute.weekdays);
     setSeats(commute.seatsOffered);
+    setContributionNote(commute.contributionNote ?? "");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
@@ -452,6 +460,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
     setDepartureEnd("08:20");
     setSelectedDays([1, 2, 3, 4, 5]);
     setSeats(1);
+    setContributionNote("");
   }
 
   async function publishTrip(commuteId: string, date: string) {
@@ -579,6 +588,17 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
     }
   }
 
+  /** Scroll a notification's target section into view and mark the notice read. */
+  async function openNotificationTarget(notification: InboxNotification) {
+    const target = notification.resourceType === "SAFETY_REPORT"
+      ? "my-reports"
+      : notification.resourceType === "TRIP_OCCURRENCE"
+        ? (roleRef.current === "DRIVER" ? "published-trips" : "activity")
+        : "activity";
+    await markNotificationRead(notification.id);
+    window.setTimeout(() => document.getElementById(target)?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+  }
+
   async function viewReportStatus(reportId: string, notificationId: string) {
     setError("");
     try {
@@ -666,13 +686,13 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
         <div className={styles.item}><h2>Notifications{unreadCount > 0 ? ` · ${unreadCount} unread` : ""}</h2>{unreadCount > 0 && <button className={styles.secondary} onClick={() => void markNotificationRead()} disabled={busy}>Mark all read</button>}</div>
         <p className={styles.muted}>Updates refresh automatically while this page is open.</p>
         {notifications.length === 0 ? <p className={styles.muted}>No notifications yet.</p> : notifications.map((notification) => <div className={styles.item} key={notification.id}>
-          <div><strong>{notification.title}{notification.readAt ? "" : " · New"}</strong><p>{notification.body} · {new Date(notification.createdAt).toLocaleString()}</p>{notification.kind === "SAFETY_REPORT_RECEIVED" && <a href="/moderation/reports">Open safety review queue</a>}{notification.kind === "SAFETY_REPORT_STATUS_UPDATED" && <button className={styles.secondary} onClick={() => void viewReportStatus(notification.resourceId, notification.id)}>View my report status</button>}</div>
+          <div><strong>{notification.title}{notification.readAt ? "" : " · New"}</strong><p>{notification.body} · {new Date(notification.createdAt).toLocaleString()}</p>{notification.kind === "SAFETY_REPORT_RECEIVED" && <a href="/moderation/reports">Open safety review queue</a>}{notification.kind === "TRIP_DISPUTE_REVIEW_REQUESTED" && <a href="/moderation/reports">Open safety review queue</a>}{notification.kind === "SAFETY_REPORT_STATUS_UPDATED" && <button className={styles.secondary} onClick={() => void viewReportStatus(notification.resourceId, notification.id)}>View my report status</button>}{notification.resourceType !== "SAFETY_REPORT" && notification.kind !== "TRIP_DISPUTE_REVIEW_REQUESTED" && <button className={styles.secondary} disabled={busy} onClick={() => void openNotificationTarget(notification)}>View on dashboard</button>}</div>
           {!notification.readAt && <button className={styles.secondary} onClick={() => void markNotificationRead(notification.id)}>Mark read</button>}
         </div>)}
         {notificationHasMore && <button className={styles.secondary} onClick={() => void loadOlderNotifications()} disabled={loadingOlderNotifications}>{loadingOlderNotifications ? "Loading…" : "Load older notifications"}</button>}
       </section>
 
-      <section className={styles.panel}>
+      <section className={styles.panel} id="activity">
         <h2>Your activity</h2>
         <p className={styles.muted}>Trips and requests from both Rider and Driver modes.</p>
         {activity.length === 0 ? <p className={styles.muted}>No trips or requests yet.</p> : activity.map((item) => (
@@ -740,6 +760,8 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
               <label>Departure until<input required type="time" value={departureEnd} onChange={(event) => setDepartureEnd(event.target.value)} /></label>
               <fieldset><legend>Days you usually travel</legend><div className={styles.days}>{weekdays.map((day, index) => <label key={day}><input type="checkbox" checked={selectedDays.includes(index)} onChange={() => toggleDay(index)} />{day}</label>)}</div></fieldset>
               <label>Seats to offer<input required min={1} max={8} type="number" value={seats} onChange={(event) => setSeats(Number(event.target.value))} /></label>
+              <label>Cost sharing note (optional)<input maxLength={160} value={contributionNote} onChange={(event) => setContributionNote(event.target.value)} placeholder="e.g. Share fuel cost" /></label>
+              <p className={styles.muted}>Display only. The app does not collect or transfer any payment.</p>
               <div className={styles.inline}>
                 <button disabled={busy || selectedDays.length === 0}>{editingCommute ? "Save changes" : "Save commute"}</button>
                 {editingCommute && <button className={styles.secondary} disabled={busy} type="button" onClick={stopEditingCommute}>Stop editing</button>}
@@ -751,7 +773,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
             <p className={styles.muted}>Your usual travel days only limit which dates are available. They do not publish trips automatically; publish each date you are offering a seat.</p>
             {commutes.length === 0 ? <p className={styles.muted}>Save a commute first. You can then publish a particular future date.</p> : commutes.map((commute) => (
               <div className={styles.item} key={commute.id}>
-                <div><strong>{commute.originArea} → {commute.destinationArea}</strong><p>{commute.departureWindowStart} · {commute.seatsOffered} seat(s) · Usually: {commute.weekdays.map((day) => weekdays[day]).join(", ")}</p></div>
+                <div><strong>{commute.originArea} → {commute.destinationArea}</strong><p>{commute.departureWindowStart} · {commute.seatsOffered} seat(s) · Usually: {commute.weekdays.map((day) => weekdays[day]).join(", ")}{commute.contributionNote ? ` · Cost sharing: ${commute.contributionNote}` : ""}</p></div>
                 <div className={styles.inline}>
                   <button className={styles.secondary} disabled={busy} type="button" onClick={() => beginEditCommute(commute)}>Edit commute</button>
                   <input aria-label="Trip date" min={new Date().toLocaleDateString("en-CA")} type="date" value={tripDate} onChange={(event) => setTripDate(event.target.value)} />
@@ -761,11 +783,11 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
               </div>
             ))}
           </section>
-          <section className={styles.panel}>
+          <section className={styles.panel} id="published-trips">
             <h2>Your published trips</h2>
             {publishedTrips.length === 0 ? <p className={styles.muted}>No upcoming trips published yet.</p> : publishedTrips.map((trip) => (
               <div className={styles.item} key={trip.tripOccurrenceId}>
-                <div><strong>{trip.originArea} → {trip.destinationArea}</strong><p>{trip.tripDate} at {trip.departureTime} · {trip.status.toLowerCase()} · {trip.seatsReserved}/{trip.seatCapacity} seats requested</p></div>
+                <div><strong>{trip.originArea} → {trip.destinationArea}</strong><p>{trip.tripDate} at {trip.departureTime} · {trip.status.toLowerCase()} · {trip.seatsReserved}/{trip.seatCapacity} seats requested{trip.contributionNote ? ` · Cost sharing: ${trip.contributionNote}` : ""}</p></div>
                 {trip.canCancel && <button className={styles.danger} disabled={busy} onClick={() => void cancelTrip(trip)}>Cancel trip</button>}
               </div>
             ))}
@@ -792,7 +814,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
             <h2>Matching trips</h2>
             {candidates.length === 0 ? <p className={styles.muted}>Search to see available trips.</p> : candidates.map((candidate) => (
               <div className={styles.item} key={candidate.tripOccurrenceId}>
-                <div><strong>{candidate.originArea} → {candidate.destinationArea}</strong><p>{candidate.displayName} · {candidate.departureTime} · {candidate.availableSeats} seat(s)</p></div>
+                <div><strong>{candidate.originArea} → {candidate.destinationArea}</strong><p>{candidate.displayName} · {candidate.departureTime} · {candidate.availableSeats} seat(s){candidate.contributionNote ? ` · Cost sharing: ${candidate.contributionNote}` : ""}</p></div>
                 <div className={styles.inline}>
                   <button disabled={busy || requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status))} onClick={() => void requestSeat(candidate)}>{requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status)) ? "Already requested" : "Request seat"}</button>
                   <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(candidate.memberId, candidate.displayName, true)}>Block</button>
@@ -829,6 +851,8 @@ function RequestList({ requests, role, busy, onAction, onConfirm, onDispute }: {
         <div>
           <strong>{request.originArea} → {request.destinationArea}</strong>
           <p>{request.tripDate} at {request.departureTime} · {request.otherParticipantName} · {request.status.toLowerCase()}{request.status === "DISPUTED" ? " — awaiting operator review" : ""}</p>
+          {request.disputeResolved && <p className={styles.inlineMessage}>A staff member reviewed the reported issue and recorded this trip as {request.status === "COMPLETED" ? "completed" : "not completed"}.</p>}
+          {request.status === "CANCELLED" && request.tripStatus === "CANCELLED" && role === "RIDER" && <p className={styles.inlineMessage}>The driver cancelled this trip, so your seat request was withdrawn.</p>}
           {/* Completion controls are only meaningful for a seat that was actually granted. */}
           {request.awaitingCompletion && request.status === "ACCEPTED" && <p className={styles.inlineMessage}>{request.riderConfirmedCompletion && request.driverConfirmedCompletion
             ? "Both sides confirmed."

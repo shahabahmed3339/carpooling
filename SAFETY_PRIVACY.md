@@ -23,7 +23,7 @@
 - Authenticated API success and error responses and Better Auth API responses are marked `Cache-Control: private, no-store`; dashboard requests also explicitly bypass browser caches. Clients should fetch personalized data again rather than relying on HTTP caches across account/session changes.
 - Dashboard requests identify the account that rendered the page; protected operations are rejected server-side if another tab changes the shared session. Responses are also checked before display, and the dashboard reloads instead of combining accounts' data. Sign-in completion, sign-out, and account closure signal same-origin tabs over `BroadcastChannel` and a `localStorage` event; messages are validated and deduplicated, with API response checks as fallback.
 - A Rider/Driver mode switch similarly signals other tabs for that account to reload. The server rechecks the current mode under the account-action lock before mode-gated writes, so a stale tab cannot publish or request in the old mode.
-- The reviewer queue and report history use the same account binding and non-cacheable fetch behavior. If reviewer access disappears or the shared account changes, the page clears report details and internal notes before navigating away.
+- The reviewer queue and report history use the same account binding and non-cacheable fetch behavior. If reviewer access disappears or the shared account changes, the page clears report details and internal notes before navigating away. The same applies to the open-dispute queue; reviewer notes on a dispute are internal and are not sent to participants, who only receive the outcome.
 
 ## Before real rides
 
@@ -35,7 +35,7 @@ A report can only be filed about a participant the reporter actually shares a tr
 
 When a reviewer changes a report's status, the reporter receives an in-app status notice. It contains no reviewer notes or report details. The reporter can open their own report list to view the latest status; this notice does not imply that a safety concern has been fully resolved or that the reporter has received a decision rationale.
 
-Ride-state updates are recorded in each recipient's inbox in the same transaction as the state change. The dashboard checks for new entries while visible, but refresh is periodic and may be delayed. No email, SMS, or push notifications are sent. Set a retention/cleanup policy before production; notification access and deletion should follow the related trip/request data.
+Ride-state updates are recorded in each recipient's inbox in the same transaction as the state change. The dashboard checks for new entries while visible, but refresh is periodic and may be delayed. No email, SMS, or push notifications are sent. `npm run db:prune-notifications` removes only notifications a recipient has already read and only after a retention window (default 90 days); unread notices are retained indefinitely until read. Choose and schedule the retention window per environment, and align it with the related trip/request retention.
 
 ### Unconfirmed trips are evidence, not blame
 

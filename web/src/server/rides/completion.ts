@@ -297,16 +297,21 @@ export async function disputeTripCompletion(input: {
       throw conflict("TRIP_NOT_DEPARTED", "You can report a problem once the trip's departure time has passed.");
     }
 
-    await client.query(
+    const disputeId = randomUUID();
+    const dispute = await client.query<{ id: string }>(
       `INSERT INTO trip_disputes (id, community_id, ride_request_id, raised_by_user_id, reason)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (ride_request_id, raised_by_user_id) DO UPDATE
-         SET reason = EXCLUDED.reason`,
-      [randomUUID(), input.actor.communityId, request.id, input.actor.userId, reason],
+         SET reason = EXCLUDED.reason,
+             resolved_at = NULL,
+             resolution = NULL
+       RETURNING id`,
+      [disputeId, input.actor.communityId, request.id, input.actor.userId, reason],
     );
 
-    // DISPUTED deliberately clears completed_at, per the schema's invariant that
-    // a disputed request is never also recorded as completed.
+    // A dispute re-opens its request: an earlier reviewer decision is contested.
+    // Only an ACCEPTED request can be disputed again; a COMPLETED/EXPIRED one is
+    // left as the reviewer set it, and the dispute row is what tracks the retry.
     await client.query(
       `UPDATE ride_requests
           SET status = 'DISPUTED', completed_at = NULL, updated_at = now()
@@ -325,6 +330,29 @@ export async function disputeTripCompletion(input: {
       resourceType: "RIDE_REQUEST",
       resourceId: request.id,
     });
+
+    // Reviewers must be able to find the dispute; an in-app notice is the only
+    // signal, since nothing pages or emails staff.
+    const reviewers = await client.query<{ user_id: string }>(
+      `SELECT user_id FROM community_memberships
+        WHERE community_id = $1 AND status = 'ACTIVE'
+          AND role IN ('OPERATOR', 'SAFETY_REVIEWER')
+        ORDER BY user_id`,
+      [input.actor.communityId],
+    );
+    for (const reviewer of reviewers.rows) {
+      await addNotification(client, {
+        communityId: input.actor.communityId,
+        recipientUserId: reviewer.user_id,
+        actorUserId: input.actor.userId,
+        kind: "TRIP_DISPUTE_REVIEW_REQUESTED",
+        eventKey: `trip-dispute-review:${dispute.rows[0]?.id ?? disputeId}:${input.actor.userId}:${reviewer.user_id}`,
+        title: "Trip dispute awaiting review",
+        body: "A participant reported a problem with a completed trip. Open the safety review queue.",
+        resourceType: "RIDE_REQUEST",
+        resourceId: request.id,
+      });
+    }
 
     return { requestId: request.id, status: "DISPUTED" };
   });

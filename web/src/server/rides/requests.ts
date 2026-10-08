@@ -212,12 +212,12 @@ export async function createTripOccurrence(input: {
           `INSERT INTO trip_occurrences (
              id, commute_template_id, community_id, driver_user_id, trip_date,
              departure_at, timezone, origin_area, destination_area,
-             seat_capacity, seats_reserved
+             seat_capacity, seats_reserved, contribution_note
            )
            SELECT $1, t.id, t.community_id, t.owner_user_id, $3::date,
                   ($3::date + t.departure_window_start) AT TIME ZONE t.timezone,
                   t.timezone, t.origin_area, t.destination_area,
-                  t.seats_offered, 0
+                  t.seats_offered, 0, t.contribution_note
              FROM commute_templates t
              JOIN communities c ON c.id = t.community_id AND c.status = 'ACTIVE'
              JOIN community_memberships m
@@ -720,6 +720,10 @@ export type RideRequestSummary = {
   awaitingCompletion: boolean;
   /** True once departure has passed, regardless of request status. */
   departurePassed: boolean;
+  /** True when a reviewer resolved a dispute about this request (trip was disputed and later decided). */
+  disputeResolved: boolean;
+  /** The parent trip's status, so a cancelled request can be explained by who cancelled it. */
+  tripStatus: "OPEN" | "CANCELLED" | "COMPLETED";
   riderConfirmedCompletion: boolean;
   driverConfirmedCompletion: boolean;
 };
@@ -734,6 +738,7 @@ export type DriverTripSummary = {
   seatsReserved: number;
   status: "OPEN" | "CANCELLED" | "COMPLETED";
   canCancel: boolean;
+  contributionNote: string | null;
 };
 
 export type AccountActivityItem = {
@@ -841,6 +846,7 @@ export async function listOwnTripOccurrences(actor: AuthenticatedActor): Promise
               seat_capacity AS "seatCapacity",
               seats_reserved AS "seatsReserved",
               status,
+              contribution_note AS "contributionNote",
               (status = 'OPEN' AND departure_at > now()) AS "canCancel"
          FROM trip_occurrences
         WHERE community_id = $1
@@ -872,6 +878,12 @@ export async function listRideRequests(actor: AuthenticatedActor): Promise<RideR
                 AND o.departure_at <= now()
                 AND o.departure_at > now() - (p.completion_window)) AS "awaitingCompletion",
               (o.departure_at <= now()) AS "departurePassed",
+              EXISTS (
+                SELECT 1 FROM trip_disputes d
+                 WHERE d.ride_request_id = r.id AND d.community_id = r.community_id
+                   AND d.resolved_at IS NOT NULL
+              ) AS "disputeResolved",
+              o.status AS "tripStatus",
               r.rider_confirmed_completion AS "riderConfirmedCompletion",
               r.driver_confirmed_completion AS "driverConfirmedCompletion"
          FROM ride_requests r

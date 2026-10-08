@@ -18,6 +18,8 @@ export type CommuteTemplateInput = {
   weekdays: number[];
   role: CommuteRole;
   seatsOffered: number;
+  /** Optional display-only cost-sharing note. The app never collects payment. */
+  contributionNote: string | null;
 };
 
 export type CommuteTemplateRecord = CommuteTemplateInput & {
@@ -62,12 +64,29 @@ function normalizeInput(input: CommuteTemplateInput): CommuteTemplateInput {
     throw invalid("SEATS_NOT_ALLOWED", "A ride-seeking commute cannot offer seats.");
   }
 
+  const contributionNote = normalizeContributionNote(input.contributionNote);
+
   return {
     ...input,
     originArea,
     destinationArea,
+    contributionNote,
     weekdays: [...input.weekdays].sort((a, b) => a - b),
   };
+}
+
+/**
+ * A short, free-text contribution note. It is display-only: no amount is parsed
+ * or stored as structured data, so it cannot be read as a price or a charge.
+ */
+export function normalizeContributionNote(value: string | null | undefined): string | null {
+  if (value === null || value === undefined) return null;
+  const trimmed = value.trim().replace(/\s+/g, " ");
+  if (trimmed.length === 0) return null;
+  if (trimmed.length > 160) {
+    throw invalid("INVALID_CONTRIBUTION_NOTE", "A contribution note must be 160 characters or fewer.");
+  }
+  return trimmed;
 }
 
 async function insertWeekdays(
@@ -111,8 +130,8 @@ export async function createCommuteTemplate(input: {
           `INSERT INTO commute_templates (
              id, community_id, owner_user_id, origin_area, destination_area,
              departure_window_start, departure_window_end, timezone,
-             role, seats_offered
-           ) VALUES ($1, $2, $3, $4, $5, $6::time, $7::time, 'Asia/Karachi', $8, $9)`,
+             role, seats_offered, contribution_note
+           ) VALUES ($1, $2, $3, $4, $5, $6::time, $7::time, 'Asia/Karachi', $8, $9, $10)`,
           [
             id,
             input.actor.communityId,
@@ -123,6 +142,7 @@ export async function createCommuteTemplate(input: {
             commute.departureWindowEnd,
             commute.role,
             commute.seatsOffered,
+            commute.contributionNote,
           ],
         );
         await insertWeekdays(client, id, commute.weekdays);
@@ -180,6 +200,7 @@ export async function updateCommuteTemplate(input: {
                   departure_window_end = $7::time,
                   role = $8,
                   seats_offered = $9,
+                  contribution_note = $11,
                   version = version + 1,
                   updated_at = now()
             WHERE id = $1
@@ -198,6 +219,7 @@ export async function updateCommuteTemplate(input: {
             commute.role,
             commute.seatsOffered,
             input.expectedVersion,
+            commute.contributionNote,
           ],
         );
 
@@ -247,13 +269,14 @@ export async function listOwnCommuteTemplates(actor: AuthenticatedActor): Promis
       weekdays: number[];
       is_active: boolean;
       version: number;
+      contribution_note: string | null;
     }>(
       `SELECT t.id, t.origin_area, t.destination_area,
               to_char(t.departure_window_start, 'HH24:MI') AS departure_window_start,
               to_char(t.departure_window_end, 'HH24:MI') AS departure_window_end,
               t.timezone, t.role, t.seats_offered,
               array_agg(d.weekday ORDER BY d.weekday) AS weekdays,
-              t.is_active, t.version
+              t.is_active, t.version, t.contribution_note
          FROM commute_templates t
          JOIN commute_template_weekdays d ON d.commute_template_id = t.id
         WHERE t.community_id = $1 AND t.owner_user_id = $2
@@ -275,6 +298,7 @@ export async function listOwnCommuteTemplates(actor: AuthenticatedActor): Promis
       weekdays: row.weekdays,
       isActive: row.is_active,
       version: row.version,
+      contributionNote: row.contribution_note,
     }));
   });
 }

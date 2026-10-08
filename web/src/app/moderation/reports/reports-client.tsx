@@ -35,6 +35,24 @@ type ReportEvent = {
   createdAt: string;
 };
 
+type TripDispute = {
+  disputeId: string;
+  requestId: string;
+  reason: string;
+  raisedByName: string;
+  riderName: string;
+  driverName: string;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departedAt: string;
+  createdAt: string;
+  requestStatus: "DISPUTED";
+  riderConfirmedCompletion: boolean;
+  driverConfirmedCompletion: boolean;
+  hasNoShowEvidence: boolean;
+};
+
 type ApiError = { error?: { code?: string; message?: string } };
 
 async function api<T>(
@@ -75,6 +93,8 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
   const [reports, setReports] = useState<Report[]>([]);
   const [closedReports, setClosedReports] = useState<Report[]>([]);
   const [evidence, setEvidence] = useState<NoShowEvidence[]>([]);
+  const [disputes, setDisputes] = useState<TripDispute[]>([]);
+  const [disputeNotes, setDisputeNotes] = useState<Record<string, string>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -92,6 +112,8 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
       setReports([]);
       setClosedReports([]);
       setEvidence([]);
+      setDisputes([]);
+      setDisputeNotes({});
       setNotes({});
       setHistory({});
       setHistoryVisibleId("");
@@ -110,14 +132,16 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
   const reload = useCallback(async () => {
     if (!accessValidRef.current) return;
     const seq = ++queueSeqRef.current;
-    const [reportResult, evidenceResult] = await Promise.all([
+    const [reportResult, evidenceResult, disputeResult] = await Promise.all([
       api<{ reports: Report[]; closedReports: Report[] }>("/api/moderation/reports", accountId, clearSensitiveStateAndRedirect),
       api<{ evidence: NoShowEvidence[] }>("/api/moderation/no-shows", accountId, clearSensitiveStateAndRedirect),
+      api<{ disputes: TripDispute[] }>("/api/moderation/disputes", accountId, clearSensitiveStateAndRedirect),
     ]);
     if (!accessValidRef.current || seq !== queueSeqRef.current) return;
     setReports(reportResult.reports);
     setClosedReports(reportResult.closedReports);
     setEvidence(evidenceResult.evidence);
+    setDisputes(disputeResult.disputes);
   }, [accountId, clearSensitiveStateAndRedirect]);
 
   useEffect(() => {
@@ -153,6 +177,25 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
       await reload();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not update report.");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function resolveDispute(disputeId: string, resolution: "TRIP_CONFIRMED" | "TRIP_NOT_COMPLETED") {
+    setBusyId(disputeId);
+    setError("");
+    setNotice("");
+    try {
+      await api(`/api/moderation/disputes/${disputeId}`, accountId, clearSensitiveStateAndRedirect, {
+        method: "PATCH",
+        body: JSON.stringify({ resolution, notes: disputeNotes[disputeId] ?? "" }),
+      });
+      if (!accessValidRef.current) return;
+      setNotice(resolution === "TRIP_CONFIRMED" ? "Dispute resolved; trip recorded as completed." : "Dispute resolved; trip recorded as not completed.");
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not resolve the dispute.");
     } finally {
       setBusyId("");
     }
@@ -221,6 +264,31 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
           <p>{report.details}</p>
           <button className={styles.secondary} disabled={historyLoadingId === report.reportId} onClick={() => void toggleHistory(report.reportId)}>{historyLoadingId === report.reportId ? "Loading history…" : historyVisibleId === report.reportId ? "Hide history" : "View history"}</button>
           {renderHistory(report.reportId)}
+        </div>
+      </article>)}
+    </section>
+
+    <section className={styles.panel}>
+      <h2>Trip disputes</h2>
+      <p className={styles.muted}>
+        Trips where a participant said the ride did not happen as agreed. A dispute is a claim, not a finding about
+        either person. Decide only whether the trip happened; resolving never penalizes anyone automatically, and both
+        participants see the outcome.
+      </p>
+      {disputes.length === 0 ? <p className={styles.muted}>No open disputes.</p> : disputes.map((dispute) => <article className={styles.item} key={dispute.disputeId}>
+        <div>
+          <strong>{dispute.originArea} → {dispute.destinationArea}</strong>
+          <p>{dispute.tripDate} · rider {dispute.riderName} · driver {dispute.driverName} · departed {new Date(dispute.departedAt).toLocaleString()}</p>
+          <p>Reported by {dispute.raisedByName} on {new Date(dispute.createdAt).toLocaleString()}: “{dispute.reason}”</p>
+          <p className={styles.muted}>
+            Confirmation at review: rider {dispute.riderConfirmedCompletion ? "confirmed" : "did not confirm"}, driver {dispute.driverConfirmedCompletion ? "confirmed" : "did not confirm"}.
+            {dispute.hasNoShowEvidence ? " An unconfirmed-trip record also exists for this trip." : ""}
+          </p>
+        </div>
+        <label className={styles.form}>Review notes (optional)<textarea maxLength={2000} rows={2} value={disputeNotes[dispute.disputeId] ?? ""} onChange={(event) => setDisputeNotes((current) => ({ ...current, [dispute.disputeId]: event.target.value }))} /></label>
+        <div className={styles.inline}>
+          <button disabled={busyId === dispute.disputeId} onClick={() => void resolveDispute(dispute.disputeId, "TRIP_CONFIRMED")}>Trip happened — mark completed</button>
+          <button className={styles.secondary} disabled={busyId === dispute.disputeId} onClick={() => void resolveDispute(dispute.disputeId, "TRIP_NOT_COMPLETED")}>Trip did not happen — mark not completed</button>
         </div>
       </article>)}
     </section>

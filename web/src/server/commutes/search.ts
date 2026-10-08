@@ -14,6 +14,7 @@ export type RideCandidate = {
   departureTime: string;
   availableSeats: number;
   departureDifferenceMinutes: number;
+  contributionNote: string | null;
 };
 
 export async function searchRideCandidates(input: {
@@ -60,6 +61,7 @@ export async function searchRideCandidates(input: {
       departure_time: string;
       available_seats: number;
       departure_difference_minutes: number;
+      contribution_note: string | null;
     }>(
       `WITH search AS (
          SELECT $1::uuid AS community_id,
@@ -80,6 +82,7 @@ export async function searchRideCandidates(input: {
               t.destination_area,
               to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS departure_time,
               (o.seat_capacity - o.seats_reserved)::integer AS available_seats,
+              o.contribution_note,
               CASE
                 WHEN s.desired_minute < candidate.local_departure_minute
                   THEN candidate.local_departure_minute - s.desired_minute
@@ -151,5 +154,6 @@ export async function searchRideCandidates(input: {
       departureTime: row.departure_time,
       availableSeats: row.available_seats,
       departureDifferenceMinutes: row.departure_difference_minutes,
+      contributionNote: row.contribution_note,
   }));
 }

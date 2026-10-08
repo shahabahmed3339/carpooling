@@ -35,6 +35,16 @@ export function requiredString(value: unknown, field: string): string {
   return value.trim();
 }
 
+/** An optional free-text field. Missing/null becomes null; a wrong type is rejected. */
+export function optionalString(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") {
+    throw new HttpInputError("Expected a text value.");
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
 export function requiredInteger(value: unknown, field: string): number {
   if (typeof value !== "number" || !Number.isInteger(value)) {
     throw new HttpInputError(`${field} must be an integer.`);

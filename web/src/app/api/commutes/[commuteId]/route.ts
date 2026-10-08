@@ -2,6 +2,7 @@ import { updateCommuteTemplate, type CommuteRole } from "@/server/commutes/templ
 import {
   jsonResult,
   HttpInputError,
+  optionalString,
   readJsonObject,
   requiredInteger,
   requiredIntegerArray,
@@ -35,6 +36,7 @@ export async function PATCH(
         weekdays: requiredIntegerArray(body.weekdays, "weekdays"),
         role,
         seatsOffered: requiredInteger(body.seatsOffered, "seatsOffered"),
+        contributionNote: optionalString(body.contributionNote),
       },
     }));
   });

@@ -2,6 +2,7 @@ import { createCommuteTemplate, listOwnCommuteTemplates, type CommuteRole } from
 import {
   jsonResult,
   HttpInputError,
+  optionalString,
   readJsonObject,
   requiredInteger,
   requiredIntegerArray,
@@ -32,6 +33,7 @@ export async function POST(request: Request): Promise<Response> {
         weekdays: requiredIntegerArray(body.weekdays, "weekdays"),
         role,
         seatsOffered: requiredInteger(body.seatsOffered, "seatsOffered"),
+        contributionNote: optionalString(body.contributionNote),
       },
     }));
   });

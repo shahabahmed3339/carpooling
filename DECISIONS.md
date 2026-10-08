@@ -59,7 +59,56 @@ Keep observed behavior separate from interpretation. Product decisions can follo
 - **Decision:** Store report submission and reviewer status changes as append-only audit events, including actor, time, transition, and internal notes. Restrict event reads to active safety reviewers/operators.
 - **Existing records:** Backfill one clearly labeled snapshot of each report's state; do not represent unknown past actions as reconstructed history.
 - **Reason:** The report row stores only current status and notes, so later updates otherwise erase prior review context and accountability.
-- **Limitations:** The client polls while visible and refreshes on focus; this is not real-time. Safety notices are in-app only; there is no email/SMS/push delivery, page/on-call behavior, response-time guarantee, or notification retention/cleanup policy.
+- **Limitations:** The client polls while visible and refreshes on focus; this is not real-time. Safety notices are in-app only; there is no email/SMS/push delivery, page/on-call behavior, or response-time guarantee. Notification retention is now bounded for old read notices (`npm run db:prune-notifications`, default 90 days) but is not scheduled by the app and does not cover unread notices.
+
+### Trip dispute review is a human decision, not an automatic penalty
+
+- **Status:** IMPLEMENTED; policy consequences unresolved.
+- **Decision:** Either participant can report that an accepted trip did not happen as agreed. The request moves to `DISPUTED`, active reviewers are notified in-app, and a reviewer records only whether the trip happened (`COMPLETED` or `EXPIRED`). Resolving notifies both participants and attaches no automatic consequence to either.
+- **Reason:** The app cannot know what happened between two people. Recording the decision and showing it to both sides is honest; inventing a penalty, refund, or reputation effect from a single report would not be.
+- **Consequence:** A reviewer could previously not see or act on a dispute at all, so the participant-facing "awaiting operator review" text described something that did not exist. A dispute raised again after a decision re-opens it for review rather than being silently absorbed.
+
+### Reviewer access is granted out-of-band
+
+- **Status:** DECIDED. Command verified by `npm run verify:reviewer-role`.
+- **Decision:** Every account is created as a marketplace `MEMBER`. Reviewer/operator access is granted only by running `npm run db:set-reviewer-role -- <email> <MEMBER|OPERATOR|SAFETY_REVIEWER>`, never from the web app.
+- **Reason:** With open signup, an in-app promotion path would let any account grant itself access to other people's reports and disputes. A separate command keeps that a deliberate operator action. Only active accounts can be promoted, so a closed account cannot regain reviewer rights.
+- **Consequence:** A deployment that never runs the command has no reviewer and no one can see the moderation queue — an operational step, not a bug. **The command was itself broken until it was tested**: its lookup selected `"user"."userId"`, but that table's primary key is `id` (`userId` exists only on `account`/`session`), so every run failed and no reviewer could be promoted. Verified and fixed; the README's equivalent SQL snippet had the same mistake.
+
+### Seat overbooking is guarded twice, deliberately
+
+- **Status:** VERIFIED by `npm run verify:concurrency`.
+- **Decision:** Keep both the application capacity guard (a conditional `UPDATE ... WHERE seats_reserved < seat_capacity`) and the database `CHECK (seats_reserved <= seat_capacity)`.
+- **Reason:** A negative control that removes the application guard shows the database constraint still refuses to overbook. Either layer alone would be a single point of failure; the conditional update returns a clean `NO_SEATS_AVAILABLE` to the losing request, while the constraint is the backstop if that guard is ever removed or bypassed.
+- **Consequence:** Overbooking requires both layers to fail. The test is proven non-vacuous, so it will catch a future regression rather than passing silently.
+
+### Cost sharing is a note, not a payment
+
+- **Status:** IMPLEMENTED (display-only); contribution terms and any payment handling are unresolved.
+- **Decision:** A driver may attach one short free-text note (≤160 characters) to a commute. It is copied to each trip occurrence at publish time, so editing the commute later does not rewrite what an already published trip advertised.
+- **Reason:** Riders commonly contribute to fuel, and leaving it unstated pushes it into an unlogged side conversation. A free-text note records the expectation without introducing an amount, a price, an escrow, or a refund path the app cannot honour. Copying at publish time keeps a trip's advertised terms stable.
+- **Consequence:** The app parses no amount and moves no money; the note must not be presented as a price or a charge. Real contribution terms, dispute handling for money, and any payment mechanism remain out of scope.
+
+### Account closure is verified, not assumed
+
+- **Status:** VERIFIED against the live schema; browser flow still unverified.
+- **Decision:** Cover closure with `npm run verify:account-closure`, which exercises the real guards and asserts the privacy, capacity, and history invariants rather than only that the status column changed.
+- **Reason:** Closure is the most destructive flow and touches other participants' rows. A status flip that leaked a reserved seat or left a membership `ACTIVE` would be a silent correctness and privacy defect that the UI would not reveal. Writing the check caught a fixture date constraint bug and proved the seat release and cancellation paths.
+- **Consequence:** The transaction logic is now evidence-backed. Scheduling the closed-account tombstone retention window is still an open policy decision.
+
+### Notification retention deletes only what was read
+
+- **Status:** DECIDED; window and scheduling are environment choices.
+- **Decision:** `npm run db:prune-notifications` deletes at most 500 notifications per run, and only rows the recipient has already read and only once older than the retention window (default 90 days). Unread notices are never deleted. `--dry-run` previews the eligible count.
+- **Reason:** The inbox otherwise grows forever. Deleting unread notices would destroy information a user has not seen — including safety outcomes — which is not a retention choice but data loss. Restricting deletion to read rows means the recipient has already consumed the notice.
+- **Consequence:** The command is bounded and needs periodic scheduling per environment; it does not cover other tables (reports, trips, tombstones), whose retention remains unresolved.
+
+### Migration checksum reconciliation is explicit and logged
+
+- **Status:** DECIDED.
+- **Decision:** If a migration file is edited after it was applied, the runner refuses to continue. The only way past it is `--rebaseline-checksum=<filename>`, which records the file's current checksum without re-running SQL, after the applied schema has been verified by hand.
+- **Reason:** Silently accepting a changed migration means a database whose schema no longer matches its history and no record of the divergence. Making the override explicit keeps that visible. The reverse — a newly added guard that was never applied — ships as a new migration (`0019`) instead of editing the applied one.
+
 
 ### Real-world readiness
 

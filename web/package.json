@@ -8,7 +8,17 @@
     "start": "next start",
     "lint": "eslint",
     "db:migrate": "node ./scripts/migrate.mjs",
-    "db:prune-idempotency": "node ./scripts/prune-idempotency.mjs"
+    "db:prune-idempotency": "node ./scripts/prune-idempotency.mjs",
+    "db:prune-notifications": "node ./scripts/prune-notifications.mjs",
+    "db:audit-retention": "node ./scripts/audit-retention.mjs",
+    "db:set-reviewer-role": "node ./scripts/set-reviewer-role.mjs",
+    "verify:dispute": "node ./scripts/verify-dispute.mjs",
+    "verify:account-closure": "node ./scripts/verify-account-closure.mjs",
+    "verify:notifications": "node ./scripts/verify-notifications.mjs",
+    "verify:concurrency": "node ./scripts/verify-concurrency.mjs",
+    "verify:contribution": "node ./scripts/verify-contribution.mjs",
+    "verify:integrity": "node ./scripts/verify-integrity.mjs",
+    "verify:reviewer-role": "node ./scripts/verify-reviewer-role.mjs"
   },
   "dependencies": {
     "@next/env": "16.4.0",

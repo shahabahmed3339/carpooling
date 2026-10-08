@@ -28,6 +28,32 @@ This describes the current product workflow. There is no manual community enroll
 
 Mode switching changes the dashboard view and available actions. It must not delete or hide ownership of the user's trips and requests. The same account can own driver trips and rider requests; the dashboard's shared activity view lists both regardless of selected mode.
 
+## Reviewer workflow (safety reports and trip disputes)
+
+Reviewer access is granted out-of-band, never from the app:
+
+```bash
+npm run db:set-reviewer-role -- <email> <OPERATOR|SAFETY_REVIEWER>
+```
+
+Only accounts whose membership role is `OPERATOR` or `SAFETY_REVIEWER` can open `/moderation/reports`. A closed account cannot be promoted back. A deployment that never runs this has no reviewer at all, so the queues below are invisible to everyone.
+
+### What the queue shows
+
+- **Open safety reports** (`RECEIVED`/`IN_REVIEW`) with reason, details, and the reported user.
+- **Recently closed reports** (`RESOLVED`/`DISMISSED`) and each report's reviewer-only history: who submitted it, who changed its status, when, and the internal notes. Earlier transitions that predate the audit table appear as a clearly labelled historical snapshot, not as reconstructed history.
+- **Trip disputes**: a participant's claim that an accepted trip did not happen as agreed. Each row also shows whether the rider and driver had confirmed, and whether an unconfirmed-trip record exists, so the decision is made with context rather than the claim alone.
+- **Unconfirmed trips**: requests whose completion window closed without both sides confirming, with which side had confirmed. This is evidence to look into, never proof that someone failed to show up.
+
+### Actions a reviewer can take
+
+- **Safety report:** start review, resolve, or dismiss, with internal notes. The reporter is told the new status but never sees the internal notes.
+- **Trip dispute:** record only whether the trip happened. `Trip happened` marks the request `COMPLETED`; `Trip did not happen` marks it `EXPIRED`. Both participants are told the outcome; neither is penalised automatically.
+
+### What the app does not do
+
+The queue refreshes on focus and every 30 seconds while open, but **sends no alert**. It does not page, email, or SMS anyone, guarantee a response time, or monitor itself. A named reviewer must check it during published support hours. Do not promise safety monitoring or emergency response. Nothing in the app enforces a consequence for a no-show or a dispute outcome — those are policy decisions that remain unresolved.
+
 ## Operational support
 
-Before real use, publish support contact/hours, cancellation/no-show/cost-sharing rules, report/block flow, retention/deletion policy, and an incident escalation procedure in the app. Current product testing does not provide those operational services automatically. Do not promise safety monitoring or emergency response.
+Before real use, publish support contact/hours, cancellation/no-show/cost-sharing rules, report/block flow, retention/deletion policy, and an incident escalation procedure in the app. Current product testing does not provide those operational services automatically. Do not promise safety monitoring or emergency response. `npm run db:audit-retention` reports aged data volumes to inform the retention policy; no retention window is applied to reports, trips, or closed accounts yet.

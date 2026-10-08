@@ -374,3 +374,209 @@ export async function listNoShowEvidence(actor: AuthenticatedActor): Promise<NoS
     return result.rows;
   });
 }
+
+export type TripDisputeSummary = {
+  disputeId: string;
+  requestId: string;
+  reason: string;
+  raisedByName: string;
+  riderName: string;
+  driverName: string;
+  originArea: string;
+  destinationArea: string;
+  tripDate: string;
+  departedAt: string;
+  createdAt: string;
+  requestStatus: "DISPUTED";
+  /** Which side had confirmed the trip when the dispute was raised. */
+  riderConfirmedCompletion: boolean;
+  driverConfirmedCompletion: boolean;
+  /** True when this request had its completion window lapse and evidence was recorded. */
+  hasNoShowEvidence: boolean;
+};
+
+/**
+ * Reviewer-facing queue of trip disputes that no one has resolved yet.
+ *
+ * A dispute means one participant said the trip did not happen as agreed. It is
+ * a claim awaiting a human decision, not a finding against either side. A
+ * `DISPUTED` request is never also `COMPLETED`; resolving it moves the request
+ * to a terminal state.
+ */
+export async function listOpenTripDisputes(actor: AuthenticatedActor): Promise<TripDisputeSummary[]> {
+  return inTransaction(async (client) => {
+    await assertSafetyReviewer(client, actor);
+    const result = await client.query<TripDisputeSummary>(
+      `SELECT d.id AS "disputeId",
+              d.ride_request_id AS "requestId",
+              d.reason,
+              raised.display_name AS "raisedByName",
+              rider.display_name AS "riderName",
+              driver.display_name AS "driverName",
+              o.origin_area AS "originArea",
+              o.destination_area AS "destinationArea",
+              to_char(o.trip_date, 'YYYY-MM-DD') AS "tripDate",
+              to_char(o.departure_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS "departedAt",
+              to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS "createdAt",
+              r.status AS "requestStatus",
+              r.rider_confirmed_completion AS "riderConfirmedCompletion",
+              r.driver_confirmed_completion AS "driverConfirmedCompletion",
+              EXISTS (
+                SELECT 1 FROM trip_no_show_evidence e WHERE e.ride_request_id = r.id
+              ) AS "hasNoShowEvidence"
+         FROM trip_disputes d
+         JOIN ride_requests r
+           ON r.id = d.ride_request_id AND r.community_id = d.community_id
+         JOIN trip_occurrences o
+           ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+         JOIN users raised ON raised.id = d.raised_by_user_id
+         JOIN users rider ON rider.id = r.rider_user_id
+         JOIN users driver ON driver.id = o.driver_user_id
+        WHERE d.community_id = $1
+          AND d.resolved_at IS NULL
+        ORDER BY d.created_at ASC, d.id ASC
+        LIMIT 100`,
+      [actor.communityId],
+    );
+    return result.rows;
+  });
+}
+
+export type TripDisputeResolution = "TRIP_CONFIRMED" | "TRIP_NOT_COMPLETED";
+
+/**
+ * Resolve a trip dispute.
+ *
+ * The reviewer decides whether the trip happened. `TRIP_CONFIRMED` marks the
+ * request `COMPLETED`; `TRIP_NOT_COMPLETED` marks it `EXPIRED`. Both are
+ * terminal states in the existing `ride_request_status` enum, so resolving a
+ * dispute does not require inventing a new request state. Resolving never
+ * penalizes either participant automatically: it only records the decision and
+ * tells both sides.
+ */
+export async function resolveTripDispute(input: {
+  actor: AuthenticatedActor;
+  disputeId: string;
+  resolution: TripDisputeResolution;
+  notes: string;
+}): Promise<{ disputeId: string; requestId: string; requestStatus: "COMPLETED" | "EXPIRED"; replayedOrExisting?: boolean }> {
+  const notes = input.notes.trim();
+  if (notes.length > 2000) throw invalid("INVALID_RESOLUTION_NOTES", "Notes must be 2,000 characters or fewer.");
+  if (input.resolution !== "TRIP_CONFIRMED" && input.resolution !== "TRIP_NOT_COMPLETED") {
+    throw invalid("INVALID_DISPUTE_RESOLUTION", "Choose whether the trip happened.");
+  }
+  return inTransaction(async (client) => {
+    await lockUserActions(client, [input.actor.userId]);
+    await assertSafetyReviewer(client, input.actor);
+
+    // Read the dispute to learn which trip it belongs to, then take locks in the
+    // same global order every ride mutation uses (trip row, then request row) so
+    // this cannot deadlock against accept/cancel/closure/completion.
+    const lookup = await client.query<{ request_id: string; trip_occurrence_id: string }>(
+      `SELECT d.ride_request_id AS request_id, r.trip_occurrence_id
+         FROM trip_disputes d
+         JOIN ride_requests r ON r.id = d.ride_request_id AND r.community_id = d.community_id
+        WHERE d.id = $1 AND d.community_id = $2`,
+      [input.disputeId, input.actor.communityId],
+    );
+    const found = lookup.rows[0];
+    if (!found) throw notFound();
+
+    await client.query(
+      "SELECT 1 FROM trip_occurrences WHERE id = $1 AND community_id = $2 FOR UPDATE",
+      [found.trip_occurrence_id, input.actor.communityId],
+    );
+
+    const disputeResult = await client.query<{ id: string; request_id: string; resolved_at: Date | null }>(
+      `SELECT id, ride_request_id, resolved_at
+         FROM trip_disputes
+        WHERE id = $1 AND community_id = $2
+        FOR UPDATE`,
+      [input.disputeId, input.actor.communityId],
+    );
+    const dispute = disputeResult.rows[0];
+    if (!dispute) throw notFound();
+
+    const requestResult = await client.query<{ id: string; status: string; rider_user_id: string }>(
+      `SELECT id, status, rider_user_id
+         FROM ride_requests
+        WHERE id = $1
+        FOR UPDATE`,
+      [dispute.request_id],
+    );
+    const request = requestResult.rows[0];
+    if (!request) throw notFound();
+
+    const nextStatus = input.resolution === "TRIP_CONFIRMED" ? "COMPLETED" : "EXPIRED";
+
+    // Idempotent replay: a second resolution of the same dispute returns the
+    // stored outcome rather than reopening or re-notifying.
+    if (dispute.resolved_at !== null) {
+      if (request.status === nextStatus) {
+        return { disputeId: dispute.id, requestId: request.id, requestStatus: nextStatus, replayedOrExisting: true };
+      }
+      throw conflict("DISPUTE_ALREADY_RESOLVED", "This dispute was already resolved with a different outcome.");
+    }
+    if (request.status !== "DISPUTED") {
+      throw conflict("REQUEST_NOT_DISPUTED", "This trip is no longer awaiting dispute review. Refresh the queue.");
+    }
+
+    const resolved = await client.query(
+      `UPDATE trip_disputes
+          SET resolved_at = clock_timestamp(),
+              resolution = $3
+        WHERE id = $1 AND community_id = $2 AND resolved_at IS NULL
+        RETURNING id`,
+      [dispute.id, input.actor.communityId, notes ? `${input.resolution}: ${notes}` : input.resolution],
+    );
+    if (resolved.rowCount !== 1) {
+      throw conflict("DISPUTE_CHANGED", "This dispute changed. Refresh the queue and try again.");
+    }
+
+    const trip = await client.query<{ driver_user_id: string }>(
+      "SELECT driver_user_id FROM trip_occurrences WHERE id = $1 AND community_id = $2",
+      [found.trip_occurrence_id, input.actor.communityId],
+    );
+    const driverUserId = trip.rows[0]?.driver_user_id;
+    if (!driverUserId) throw notFound();
+
+    const moved = await client.query(
+      `UPDATE ride_requests
+          SET status = $3::ride_request_status,
+              completed_at = CASE WHEN $3::ride_request_status = 'COMPLETED' THEN COALESCE(completed_at, clock_timestamp()) ELSE completed_at END,
+              updated_at = clock_timestamp()
+        WHERE id = $1 AND status = 'DISPUTED'
+          AND trip_occurrence_id = $2
+        RETURNING id`,
+      [request.id, found.trip_occurrence_id, nextStatus],
+    );
+    if (moved.rowCount !== 1) {
+      throw conflict("REQUEST_CHANGED", "This trip changed while resolving the dispute. Refresh the queue.");
+    }
+
+    // Notify both sides. The message states the decision, not internal notes.
+    for (const recipientUserId of [request.rider_user_id, driverUserId]) {
+      await addNotification(client, {
+        communityId: input.actor.communityId,
+        recipientUserId,
+        actorUserId: input.actor.userId,
+        kind: "TRIP_DISPUTE_RESOLVED",
+        eventKey: `trip-dispute-resolved:${dispute.id}:${recipientUserId}:${nextStatus}`,
+        title: "Trip review completed",
+        body: nextStatus === "COMPLETED"
+          ? "A staff member reviewed the reported issue and recorded the trip as completed."
+          : "A staff member reviewed the reported issue and recorded the trip as not completed.",
+        resourceType: "RIDE_REQUEST",
+        resourceId: request.id,
+      });
+    }
+
+    // Touch the trip's timestamp so reviewers tailing the queue see progress.
+    await client.query(
+      `UPDATE trip_occurrences SET updated_at = now() WHERE id = $1 AND community_id = $2`,
+      [found.trip_occurrence_id, input.actor.communityId],
+    );
+
+    return { disputeId: dispute.id, requestId: request.id, requestStatus: nextStatus };
+  });
+}
