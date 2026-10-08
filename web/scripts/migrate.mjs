@@ -56,6 +56,18 @@ try {
   const directory = new URL("../db/migrations/", import.meta.url);
   const files = (await readdir(directory)).filter((name) => name.endsWith(".sql")).sort();
 
+  // A migration file can end up edited after it was applied (for example when a
+  // follow-up edit was made before the file was committed). That is normally an
+  // error, so the default is to refuse. `--rebaseline-checksum=<file>` is an
+  // explicit, logged opt-in for a file whose *applied semantics* have been
+  // verified against the database by hand; it records the current file checksum
+  // and never re-runs the SQL.
+  const rebaselineArg = process.argv.find((arg) => arg.startsWith("--rebaseline-checksum="));
+  const rebaselineFile = rebaselineArg?.slice("--rebaseline-checksum=".length) || null;
+  if (rebaselineArg && (!rebaselineFile || !files.includes(rebaselineFile))) {
+    throw new Error("Pass --rebaseline-checksum=<migration filename that exists in db/migrations>.");
+  }
+
   for (const filename of files) {
     const sql = await readFile(new URL(filename, directory), "utf8");
     const checksum = createHash("sha256").update(sql).digest();
@@ -66,7 +78,17 @@ try {
 
     if (existing.rowCount) {
       if (!existing.rows[0].checksum.equals(checksum)) {
-        throw new Error(`Applied migration ${filename} has changed; add a new migration instead.`);
+        if (filename !== rebaselineFile) {
+          throw new Error(
+            `Applied migration ${filename} has changed; add a new migration instead. ` +
+            `If you have verified the applied schema by hand, re-run with --rebaseline-checksum=${filename}.`,
+          );
+        }
+        process.stdout.write(`Re-baselining recorded checksum for ${filename} (SQL not re-run).\n`);
+        await client.query(
+          "UPDATE schema_migrations SET checksum = $2 WHERE version = $1",
+          [filename, checksum],
+        );
       }
       continue;
     }
