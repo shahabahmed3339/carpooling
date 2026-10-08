@@ -2,6 +2,7 @@ import { Suspense } from "react";
 import Link from "next/link";
 import { getPilotAccessState } from "@/server/auth/actor";
 import SignOutButton from "./sign-out";
+import SessionChangeBroadcast from "./session-change-broadcast";
 import styles from "../../login/login.module.css";
 
 type AuthCompletePageProps = {
@@ -47,6 +48,7 @@ async function AuthCompleteContent({
         <p className={styles.kicker}>CARPOOL PAKISTAN</p>
         <h1>{content.title}</h1>
         <p className={styles.description}>{content.body}</p>
+        {access.status === "ACTIVE" && <SessionChangeBroadcast accountId={access.actor.userId} />}
         {access.status === "ACTIVE" && <Link className={styles.actionLink} href="/dashboard">Go to your dashboard</Link>}
         {access.status !== "ACTIVE" && <Link className={styles.actionLink} href="/login">Back to sign in</Link>}
         {access.status !== "SIGNED_OUT" && access.status !== "AUTH_DISABLED" && <SignOutButton />}

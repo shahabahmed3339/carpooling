@@ -22,6 +22,21 @@ export async function assertActiveCommunityMember(
   if (result.rowCount !== 1) throw forbidden();
 }
 
+/** Recheck a mode-gated write after taking the user's account-action lock. */
+export async function assertCurrentParticipantRole(
+  client: PoolClient,
+  userId: string,
+  expected: ParticipantRole,
+): Promise<void> {
+  const result = await client.query<{ participant_role: ParticipantRole }>(
+    `SELECT participant_role FROM users
+      WHERE id = $1 AND status = 'ACTIVE'
+      FOR UPDATE`,
+    [userId],
+  );
+  if (result.rows[0]?.participant_role !== expected) throw forbidden();
+}
+
 export function assertParticipantRole(
   actual: ParticipantRole,
   expected: ParticipantRole,

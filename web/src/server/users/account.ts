@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 import { assertActiveCommunityMember } from "@/server/community/access";
 import { inTransaction } from "@/server/db/pool";
-import { invalid } from "@/server/rides/errors";
+import { conflict, invalid } from "@/server/rides/errors";
+import { lockUserActions } from "@/server/users/action-lock";
+import { addNotification } from "@/server/notifications/inbox";
 import type { PoolClient } from "pg";
 
 export type AccountDeletionResult = {
@@ -20,7 +22,8 @@ export type AccountDeletionResult = {
  *   1. refuse while the account still has live commitments it must resolve,
  *   2. withdraw its pending/accepted requests and cancel its future trips,
  *   3. deactivate the account and erase identifying fields,
- *   4. release the membership so the account stops participating in matching.
+ *   4. release membership and authentication records so the account cannot
+ *      participate in matching or retain a sign-in identity.
  *
  * The retained row is a tombstone: no email, no display name, and no ability to
  * sign in. Completed trip history survives anonymously, which is what keeps
@@ -28,61 +31,27 @@ export type AccountDeletionResult = {
  */
 export async function deleteOwnAccount(input: {
   actor: AuthenticatedActor;
-  reason?: string;
 }): Promise<AccountDeletionResult> {
-  const reason = input.reason?.trim();
-  if (reason !== undefined && reason.length > 500) {
-    throw invalid("INVALID_DELETION_REASON", "Reason must be 500 characters or fewer.");
-  }
-
   return inTransaction(async (client) => {
+    await lockUserActions(client, [input.actor.userId]);
     await assertActiveCommunityMember(client, input.actor.communityId, input.actor.userId);
 
-    // Serialize deletion against concurrent trip/request mutations for this
-    // account by taking the same per-user lock those operations rely on.
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      `account-delete:${input.actor.userId}`,
-    ]);
-
-    const account = await client.query<{ status: string }>(
-      "SELECT status FROM users WHERE id = $1 FOR UPDATE",
+    const account = await client.query<{ status: string; auth_subject: string }>(
+      "SELECT status, auth_subject FROM users WHERE id = $1 FOR UPDATE",
       [input.actor.userId],
     );
     if (account.rows[0]?.status !== "ACTIVE") {
       throw invalid("ACCOUNT_NOT_ACTIVE", "This account is already closed.");
     }
-
-    // A passenger or driver currently mid-trip must be resolved first, since
-    // silently cancelling an in-progress trip would strand the counterparty.
-    // Scoped to the caller: every account shares one marketplace community, so
-    // filtering on community_id alone would match other people's trips.
-    const inProgress = await client.query(
-      `SELECT 1
-         FROM ride_requests r
-         JOIN trip_occurrences o
-           ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
-        WHERE r.community_id = $1
-          AND (r.rider_user_id = $2 OR o.driver_user_id = $2)
-          AND r.status IN ('REQUESTED', 'ACCEPTED')
-          AND o.status = 'OPEN'
-          AND o.departure_at <= now()
-        LIMIT 1`,
-      [input.actor.communityId, input.actor.userId],
-    );
-    if (inProgress.rowCount) {
-      throw invalid(
-        "ACCOUNT_HAS_IN_PROGRESS_TRIP",
-        "A trip you are involved in has already departed. Resolve or wait for it to complete before closing your account.",
-      );
-    }
+    const authSubject = account.rows[0].auth_subject;
 
     const withdrawn = await withdrawOpenCommitments(client, input.actor);
 
     const requestId = randomUUID();
     await client.query(
       `INSERT INTO account_deletion_requests (id, user_id, reason, completed_at)
-       VALUES ($1, $2, $3, now())`,
-      [requestId, input.actor.userId, reason ?? null],
+       VALUES ($1, $2, NULL, now())`,
+      [requestId, input.actor.userId],
     );
 
     // Erase identifying data. display_name stays non-null (NOT NULL + length
@@ -106,8 +75,25 @@ export async function deleteOwnAccount(input: {
       [input.actor.communityId, input.actor.userId],
     );
 
-    // Sessions must not outlive the account.
-    await client.query(`DELETE FROM "session" WHERE "userId" = $1`, [input.actor.userId]);
+    // Remove the authentication identity and credentials as well as sessions.
+    // Better Auth uses its default model names here (`user`, `account`,
+    // `session`, `verification`); this app's separate `users` row remains as
+    // the anonymous historical tombstone above.
+    await client.query(`DELETE FROM "session" WHERE "userId" = $1`, [authSubject]);
+    await client.query(`DELETE FROM "account" WHERE "userId" = $1`, [authSubject]);
+    // The magic-link plugin keys verification rows by a hashed token, not email.
+    // Its JSON payload carries the email; match only its known JSON prefix so
+    // unrelated verification records are left untouched.
+    await client.query(
+      `DELETE FROM "verification"
+        WHERE CASE
+          WHEN value LIKE '{"type":"magic-link","email":%'
+            THEN lower(value::jsonb ->> 'email') = lower($1)
+          ELSE false
+        END`,
+      [input.actor.email],
+    );
+    await client.query(`DELETE FROM "user" WHERE id = $1`, [authSubject]);
 
     return {
       status: "DEACTIVATED",
@@ -122,48 +108,144 @@ async function withdrawOpenCommitments(
   client: PoolClient,
   actor: AuthenticatedActor,
 ): Promise<{ tripsCancelled: number; requestsWithdrawn: number }> {
-  const requests = await client.query(
-    `UPDATE ride_requests
-        SET status = 'CANCELLED', updated_at = now()
-      WHERE community_id = $1
-        AND rider_user_id = $2
-        AND status IN ('REQUESTED', 'ACCEPTED')
-      RETURNING id`,
+  // Lock all affected trips in one stable order, before their request rows.
+  // This makes acceptance/cancellation races resolve to one complete outcome
+  // and avoids deadlocks if this account is a rider on one trip and driver on
+  // another.
+  const trips = await client.query<{ id: string; has_rider_request: boolean; has_future_driver_trip: boolean }>(
+    `SELECT o.id,
+            EXISTS (
+              SELECT 1 FROM ride_requests r
+               WHERE r.trip_occurrence_id = o.id AND r.community_id = o.community_id
+                 AND r.rider_user_id = $2 AND r.status IN ('REQUESTED', 'ACCEPTED')
+            ) AS has_rider_request,
+            (o.driver_user_id = $2 AND o.status = 'OPEN' AND o.departure_at > clock_timestamp()) AS has_future_driver_trip
+       FROM trip_occurrences o
+      WHERE o.community_id = $1
+        AND (
+          EXISTS (
+            SELECT 1 FROM ride_requests r
+             WHERE r.trip_occurrence_id = o.id AND r.community_id = o.community_id
+               AND r.rider_user_id = $2 AND r.status IN ('REQUESTED', 'ACCEPTED')
+          ) OR (
+            o.driver_user_id = $2 AND o.status = 'OPEN' AND o.departure_at > clock_timestamp()
+          )
+        )
+      ORDER BY o.id
+      FOR UPDATE OF o`,
     [actor.communityId, actor.userId],
   );
+  const riderTripIds = trips.rows.filter((row) => row.has_rider_request).map((row) => row.id);
+  const driverTripIds = trips.rows.filter((row) => row.has_future_driver_trip).map((row) => row.id);
+
+  // Recheck after acquiring trip locks, using wall-clock time. A departure
+  // could pass while closure waited for another transaction to release a lock.
+  const inProgress = await client.query(
+    `SELECT 1
+       FROM ride_requests r
+       JOIN trip_occurrences o
+         ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+      WHERE r.community_id = $1
+        AND (r.rider_user_id = $2 OR o.driver_user_id = $2)
+        AND r.status IN ('REQUESTED', 'ACCEPTED')
+        AND o.status = 'OPEN'
+        AND o.departure_at <= clock_timestamp()
+      LIMIT 1`,
+    [actor.communityId, actor.userId],
+  );
+  if (inProgress.rowCount) {
+    throw invalid(
+      "ACCOUNT_HAS_IN_PROGRESS_TRIP",
+      "A trip you are involved in has already departed. Resolve or wait for it to complete before closing your account.",
+    );
+  }
+
+  const acceptedCounts = riderTripIds.length === 0 ? [] : (await client.query<{ trip_occurrence_id: string; accepted_count: number }>(
+    `SELECT r.trip_occurrence_id, count(*)::integer AS accepted_count
+       FROM ride_requests r
+       JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
+      WHERE r.community_id = $1 AND r.rider_user_id = $2
+        AND r.trip_occurrence_id = ANY($3::uuid[])
+        AND r.status = 'ACCEPTED' AND o.status = 'OPEN'
+      GROUP BY r.trip_occurrence_id
+      ORDER BY r.trip_occurrence_id`,
+    [actor.communityId, actor.userId, riderTripIds],
+  )).rows;
+
+  const requests = await client.query<{ id: string; trip_occurrence_id: string; driver_user_id: string }>(
+    `UPDATE ride_requests r
+        SET status = 'CANCELLED', updated_at = now()
+       FROM trip_occurrences o
+      WHERE r.community_id = $1 AND r.rider_user_id = $2
+        AND r.trip_occurrence_id = o.id AND r.community_id = o.community_id
+        AND r.status IN ('REQUESTED', 'ACCEPTED')
+      RETURNING r.id, r.trip_occurrence_id, o.driver_user_id`,
+    [actor.communityId, actor.userId],
+  );
+  for (const request of requests.rows) {
+    await addNotification(client, {
+      communityId: actor.communityId,
+      recipientUserId: request.driver_user_id,
+      actorUserId: actor.userId,
+      kind: "RIDE_CANCELLED",
+      eventKey: `account-close-ride-cancelled:${request.id}`,
+      title: "Seat request cancelled",
+      body: "A participant closed their account, so their seat request was withdrawn.",
+      resourceType: "RIDE_REQUEST",
+      resourceId: request.id,
+    });
+  }
+  for (const accepted of acceptedCounts) {
+    const releasedSeat = await client.query(
+      `UPDATE trip_occurrences
+          SET seats_reserved = seats_reserved - $2, updated_at = now()
+        WHERE id = $1 AND community_id = $3 AND status = 'OPEN'
+          AND seats_reserved >= $2
+        RETURNING id`,
+      [accepted.trip_occurrence_id, accepted.accepted_count, actor.communityId],
+    );
+    if (releasedSeat.rowCount !== 1) {
+      throw conflict("CAPACITY_STATE_INVALID", "Trip seat counts are inconsistent. Account closure was not completed.");
+    }
+  }
 
   // Cancelling a future trip must also withdraw the requests attached to it;
   // releasing only the driver's own requests would leave riders holding seats
   // on a trip that no longer exists.
-  const trips = await client.query<{ id: string }>(
-    `SELECT id FROM trip_occurrences
-      WHERE community_id = $1 AND driver_user_id = $2
-        AND status = 'OPEN' AND departure_at > now()
-      FOR UPDATE`,
-    [actor.communityId, actor.userId],
-  );
-
   let requestsWithdrawn = requests.rowCount ?? 0;
-  if (trips.rows.length > 0) {
-    const tripIds = trips.rows.map((row) => row.id);
-    const released = await client.query(
-      `UPDATE ride_requests
+  if (driverTripIds.length > 0) {
+    const released = await client.query<{ id: string; trip_occurrence_id: string; rider_user_id: string }>(
+      `UPDATE ride_requests r
           SET status = 'CANCELLED', updated_at = now()
-        WHERE community_id = $1
-          AND trip_occurrence_id = ANY($2::uuid[])
-          AND status IN ('REQUESTED', 'ACCEPTED')
-        RETURNING id`,
-      [actor.communityId, tripIds],
+        WHERE r.community_id = $1
+          AND r.trip_occurrence_id = ANY($2::uuid[])
+          AND r.status IN ('REQUESTED', 'ACCEPTED')
+        RETURNING r.id, r.trip_occurrence_id, r.rider_user_id`,
+      [actor.communityId, driverTripIds],
     );
     requestsWithdrawn += released.rowCount ?? 0;
+
+    for (const request of released.rows) {
+      await addNotification(client, {
+        communityId: actor.communityId,
+        recipientUserId: request.rider_user_id,
+        actorUserId: actor.userId,
+        kind: "TRIP_CANCELLED",
+        eventKey: `account-close-trip-cancelled:${request.trip_occurrence_id}:${request.id}`,
+        title: "Trip cancelled",
+        body: "The driver closed their account, so this trip and your seat request were cancelled.",
+        resourceType: "TRIP_OCCURRENCE",
+        resourceId: request.trip_occurrence_id,
+      });
+    }
 
     await client.query(
       `UPDATE trip_occurrences
           SET status = 'CANCELLED', seats_reserved = 0, updated_at = now()
         WHERE community_id = $1 AND id = ANY($2::uuid[]) AND status = 'OPEN'`,
-      [actor.communityId, tripIds],
+      [actor.communityId, driverTripIds],
     );
   }
 
-  return { tripsCancelled: trips.rows.length, requestsWithdrawn };
+  return { tripsCancelled: driverTripIds.length, requestsWithdrawn };
 }

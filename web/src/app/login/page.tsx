@@ -1,8 +1,22 @@
+import { Suspense } from "react";
 import Link from "next/link";
+import { redirect } from "next/navigation";
+import { getPilotAccessState } from "@/server/auth/actor";
 import LoginForm from "./login-form";
 import styles from "./login.module.css";
 
 export default function LoginPage() {
+  return (
+    <Suspense fallback={<main className={styles.page}><section className={styles.card}><p className={styles.kicker}>CARPOOL PAKISTAN</p><h1>Checking your sign-in…</h1></section></main>}>
+      <LoginContent />
+    </Suspense>
+  );
+}
+
+async function LoginContent() {
+  const access = await getPilotAccessState();
+  if (access.status === "ACTIVE") redirect("/dashboard");
+
   const enabled = process.env.AUTH_ENABLED === "true";
   const authHost = process.env.BETTER_AUTH_URL ? new URL(process.env.BETTER_AUTH_URL).hostname.replace(/^\[|\]$/g, "") : "";
   const localDevelopment = process.env.NODE_ENV === "development" && ["localhost", "127.0.0.1", "::1"].includes(authHost);

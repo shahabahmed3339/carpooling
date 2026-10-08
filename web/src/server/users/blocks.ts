@@ -3,12 +3,13 @@ import type { PoolClient } from "pg";
 import { assertActiveCommunityMember } from "@/server/community/access";
 import { inTransaction } from "@/server/db/pool";
 import { invalid } from "@/server/rides/errors";
+import { lockUserActions } from "@/server/users/action-lock";
 
 export type BlockedUser = { userId: string; displayName: string };
 
 export async function lockUserPair(client: PoolClient, firstUserId: string, secondUserId: string): Promise<void> {
   const pairKey = [firstUserId, secondUserId].sort().join(":");
-  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [pairKey]);
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`user-pair:${pairKey}`]);
 }
 
 export async function listBlockedUsers(actor: AuthenticatedActor): Promise<BlockedUser[]> {
@@ -30,6 +31,7 @@ export async function listBlockedUsers(actor: AuthenticatedActor): Promise<Block
 export async function blockUser(actor: AuthenticatedActor, targetUserId: string): Promise<{ userId: string; blocked: true }> {
   if (targetUserId === actor.userId) throw invalid("CANNOT_BLOCK_SELF", "You cannot block your own account.");
   return inTransaction(async (client) => {
+    await lockUserActions(client, [actor.userId, targetUserId]);
     await assertActiveCommunityMember(client, actor.communityId, actor.userId);
     await assertActiveCommunityMember(client, actor.communityId, targetUserId);
     await lockUserPair(client, actor.userId, targetUserId);
@@ -45,6 +47,7 @@ export async function blockUser(actor: AuthenticatedActor, targetUserId: string)
 
 export async function unblockUser(actor: AuthenticatedActor, targetUserId: string): Promise<{ userId: string; blocked: false }> {
   return inTransaction(async (client) => {
+    await lockUserActions(client, [actor.userId, targetUserId]);
     await assertActiveCommunityMember(client, actor.communityId, actor.userId);
     await lockUserPair(client, actor.userId, targetUserId);
     await client.query(

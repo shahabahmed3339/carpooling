@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { parseClockMinutes, normalizeArea } from "@/domain/clock";
-import { assertActiveCommunityMember, assertParticipantRole } from "@/server/community/access";
+import { assertActiveCommunityMember, assertCurrentParticipantRole, assertParticipantRole } from "@/server/community/access";
 import { withIdempotency, type IdempotentResult } from "@/server/db/idempotency";
 import { inTransaction } from "@/server/db/pool";
+import { lockUserActions } from "@/server/users/action-lock";
 import { conflict, invalid, notFound } from "@/server/rides/errors";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 
@@ -91,6 +92,8 @@ export async function createCommuteTemplate(input: {
   if (commute.role === "EITHER") throw invalid("INVALID_COMMUTE_ROLE", "Choose the role associated with your account.");
 
   return inTransaction(async (client) => {
+    await lockUserActions(client, [input.actor.userId]);
+    await assertCurrentParticipantRole(client, input.actor.userId, commute.role === "OFFERING" ? "DRIVER" : "RIDER");
     await assertActiveCommunityMember(client, input.actor.communityId, input.actor.userId);
 
     return withIdempotency<CommuteTemplateRecord>({
@@ -154,6 +157,8 @@ export async function updateCommuteTemplate(input: {
   }
 
   return inTransaction(async (client) => {
+    await lockUserActions(client, [input.actor.userId]);
+    await assertCurrentParticipantRole(client, input.actor.userId, commute.role === "OFFERING" ? "DRIVER" : "RIDER");
     await assertActiveCommunityMember(client, input.actor.communityId, input.actor.userId);
     return withIdempotency<CommuteTemplateRecord>({
       client,

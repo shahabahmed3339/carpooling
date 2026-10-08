@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth-client";
+import { announceAuthSessionChange } from "@/lib/session-change";
 import styles from "../../login/login.module.css";
 
 export default function SignOutButton() {
@@ -14,7 +15,9 @@ export default function SignOutButton() {
     setBusy(true);
     setFailed(false);
     try {
-      await authClient.signOut();
+      const result = await authClient.signOut();
+      if (result.error) throw new Error("Sign out failed.");
+      announceAuthSessionChange(null);
       router.replace("/login");
     } catch {
       setFailed(true);

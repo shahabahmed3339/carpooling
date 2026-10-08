@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "db:migrate": "node ./scripts/migrate.mjs"
+    "db:migrate": "node ./scripts/migrate.mjs",
+    "db:prune-idempotency": "node ./scripts/prune-idempotency.mjs"
   },
   "dependencies": {
     "@next/env": "16.4.0",

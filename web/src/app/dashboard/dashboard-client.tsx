@@ -1,8 +1,14 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { flushSync } from "react-dom";
 import SignOutButton from "@/app/auth/complete/sign-out";
+import {
+  announceAuthSessionChange,
+  announceParticipantModeChange,
+  listenForAuthSessionChange,
+  listenForParticipantModeChange,
+} from "@/lib/session-change";
 import styles from "./dashboard.module.css";
 
 type ParticipantRole = "RIDER" | "DRIVER";
@@ -77,6 +83,17 @@ type SafetyReport = {
   createdAt: string;
 };
 type ReportDraft = { userId: string; displayName: string; tripOccurrenceId: string };
+type InboxNotification = {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+  resourceType: "RIDE_REQUEST" | "TRIP_OCCURRENCE" | "SAFETY_REPORT";
+  resourceId: string;
+  createdAt: string;
+  cursorCreatedAt: string;
+  readAt: string | null;
+};
 
 const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -88,19 +105,110 @@ function weekdayForDate(date: string): number | null {
   return parsed.getUTCDay();
 }
 
-function idempotencyKey(): string {
-  return crypto.randomUUID();
+function currentTimestamp(): number {
+  return Date.now();
 }
 
-async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, { ...init, headers: { "Content-Type": "application/json", ...init?.headers } });
-  const payload = await response.json().catch(() => ({})) as T & { error?: { message?: string } };
+async function api<T>(
+  url: string,
+  init?: RequestInit,
+  expectedAccountId?: string,
+  expectedMode?: ParticipantRole,
+  onContextChanged?: (destination: string) => void,
+): Promise<T> {
+  const headers = new Headers(init?.headers);
+  if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  const response = await fetch(url, { ...init, cache: "no-store", headers });
+  if (response.status === 401) {
+    if (onContextChanged) onContextChanged("/login");
+    else window.location.replace("/login");
+    throw new Error("Your sign-in expired. Redirecting to sign-in.");
+  }
+  const responseAccountId = response.headers.get("X-Carpool-Actor");
+  if (expectedAccountId && response.status === 403 && !responseAccountId) {
+    if (onContextChanged) onContextChanged("/auth/complete");
+    else window.location.replace("/auth/complete");
+    throw new Error("This account is unavailable. Redirecting.");
+  }
+  if (expectedAccountId && (
+    (responseAccountId !== null && responseAccountId !== expectedAccountId) ||
+    (response.ok && responseAccountId === null)
+  )) {
+    // A different tab may have signed into another account. Discard this
+    // account's in-memory dashboard before displaying the new account's data.
+    if (onContextChanged) onContextChanged("/dashboard");
+    else window.location.replace("/dashboard");
+    throw new Error("Your signed-in account changed. Reloading your dashboard.");
+  }
+  const responseMode = response.headers.get("X-Carpool-Mode");
+  if (expectedMode && responseMode && responseMode !== expectedMode) {
+    // The account's mode changed in another tab or device. Reload server state
+    // before rendering more forms or applying another mode-gated action.
+    if (onContextChanged) onContextChanged("/dashboard");
+    else window.location.replace("/dashboard");
+    throw new Error("Your Rider/Driver mode changed. Reloading your dashboard.");
+  }
+  let payload: T & { error?: { message?: string } };
+  try {
+    payload = await response.json() as T & { error?: { message?: string } };
+  } catch {
+    if (response.ok) {
+      throw new Error("The server response could not be read. Retry the same action safely.");
+    }
+    payload = {} as T & { error?: { message?: string } };
+  }
   if (!response.ok) throw new Error(payload.error?.message ?? "Could not complete the request.");
   return payload;
 }
 
-export default function DashboardClient({ initialMode, accountEmail }: { initialMode: ParticipantRole; accountEmail: string }) {
-  const router = useRouter();
+async function requestFingerprint(value: string): Promise<string> {
+  // Keep request bodies (which may contain safety-report details) out of the
+  // pending-key map and make accidental key-map collisions negligible.
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+const pendingIdempotencyStorageKey = "carpool.pending-idempotency.v1";
+const pendingIdempotencyLifetimeMs = 23 * 60 * 60 * 1000;
+type PendingIdempotencyKey = { key: string; createdAt: number };
+
+function loadPendingIdempotencyKeys(): Map<string, PendingIdempotencyKey> {
+  if (typeof window === "undefined") return new Map();
+  try {
+    const stored = window.sessionStorage.getItem(pendingIdempotencyStorageKey);
+    if (!stored) return new Map();
+    const entries: unknown = JSON.parse(stored);
+    if (!Array.isArray(entries)) return new Map();
+    const now = currentTimestamp();
+    const pending = new Map<string, PendingIdempotencyKey>();
+    for (const entry of entries) {
+      if (!Array.isArray(entry) || entry.length !== 2 ||
+          typeof entry[0] !== "string" || !/^[0-9a-f]{64}$/.test(entry[0]) ||
+          !entry[1] || typeof entry[1] !== "object") continue;
+      const value = entry[1] as Partial<PendingIdempotencyKey>;
+      if (typeof value.key !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value.key) ||
+          typeof value.createdAt !== "number" || !Number.isFinite(value.createdAt) ||
+          value.createdAt > now + 5 * 60 * 1000 || now - value.createdAt >= pendingIdempotencyLifetimeMs) continue;
+      pending.set(entry[0], { key: value.key, createdAt: value.createdAt });
+    }
+    return pending;
+  } catch {
+    return new Map();
+  }
+}
+
+function savePendingIdempotencyKeys(keys: Map<string, PendingIdempotencyKey>): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (keys.size === 0) window.sessionStorage.removeItem(pendingIdempotencyStorageKey);
+    else window.sessionStorage.setItem(pendingIdempotencyStorageKey, JSON.stringify([...keys]));
+  } catch {
+    // In-memory keys still protect same-page retries if storage is unavailable.
+  }
+}
+
+export default function DashboardClient({ initialMode, accountEmail, accountId }: { initialMode: ParticipantRole; accountEmail: string; accountId: string }) {
   const [role, setRole] = useState<ParticipantRole>(initialMode);
   const [commutes, setCommutes] = useState<Commute[]>([]);
   const [requests, setRequests] = useState<RideRequest[]>([]);
@@ -109,6 +217,10 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   const [blockedUsers, setBlockedUsers] = useState<{ userId: string; displayName: string }[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [myReports, setMyReports] = useState<SafetyReport[]>([]);
+  const [notifications, setNotifications] = useState<InboxNotification[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notificationHasMore, setNotificationHasMore] = useState(false);
+  const [loadingOlderNotifications, setLoadingOlderNotifications] = useState(false);
   const [reportDraft, setReportDraft] = useState<ReportDraft | null>(null);
   const [reportReason, setReportReason] = useState<SafetyReport["reason"]>("SAFETY_CONCERN");
   const [reportDetails, setReportDetails] = useState("");
@@ -126,9 +238,99 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [sessionChanging, setSessionChanging] = useState(false);
 
   const roleRef = useRef(role);
   const loadSeqRef = useRef(0);
+  const notificationSeqRef = useRef(0);
+  const loadingOlderNotificationsRef = useRef(false);
+  const loadedOlderNotificationsRef = useRef(false);
+  const pendingIdempotencyKeysRef = useRef<Map<string, PendingIdempotencyKey> | null>(null);
+  if (pendingIdempotencyKeysRef.current === null) {
+    pendingIdempotencyKeysRef.current = loadPendingIdempotencyKeys();
+  }
+
+  const hideDashboardAndRedirect = useCallback((destination: string) => {
+    flushSync(() => setSessionChanging(true));
+    window.location.replace(destination);
+  }, []);
+
+  const accountApi = useCallback(async function accountApi<T>(
+    url: string,
+    init?: RequestInit,
+  ): Promise<T> {
+    const headers = new Headers(init?.headers);
+    headers.set("X-Expected-Carpool-Actor", accountId);
+    return api<T>(url, { ...init, headers }, accountId, roleRef.current, hideDashboardAndRedirect);
+  }, [accountId, hideDashboardAndRedirect]);
+
+  async function apiIdempotent<T>(url: string, init: RequestInit): Promise<T> {
+    const fingerprint = await requestFingerprint(JSON.stringify([accountId, url, init.method ?? "GET", init.body ?? null]));
+    const pendingKeys = pendingIdempotencyKeysRef.current!;
+    const now = currentTimestamp();
+    for (const [storedFingerprint, storedKey] of pendingKeys) {
+      if (now - storedKey.createdAt >= pendingIdempotencyLifetimeMs || storedKey.createdAt > now + 5 * 60 * 1000) {
+        pendingKeys.delete(storedFingerprint);
+      }
+    }
+    let pending = pendingKeys.get(fingerprint);
+    if (!pending) {
+      pending = { key: crypto.randomUUID(), createdAt: now };
+      pendingKeys.set(fingerprint, pending);
+    }
+    savePendingIdempotencyKeys(pendingKeys);
+
+    const headers = new Headers(init.headers);
+    headers.set("Idempotency-Key", pending.key);
+    const result = await accountApi<T>(url, { ...init, headers });
+    pendingKeys.delete(fingerprint);
+    savePendingIdempotencyKeys(pendingKeys);
+    return result;
+  }
+
+  const refreshNotifications = useCallback(async () => {
+    const seq = ++notificationSeqRef.current;
+    try {
+      const result = await accountApi<{ notifications: InboxNotification[]; unreadCount: number; hasMore: boolean }>("/api/notifications");
+      if (seq !== notificationSeqRef.current) return;
+      setNotifications((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        for (const item of result.notifications) byId.set(item.id, item);
+        return [...byId.values()].sort((a, b) => b.cursorCreatedAt.localeCompare(a.cursorCreatedAt) || b.id.localeCompare(a.id));
+      });
+      setUnreadCount(result.unreadCount);
+      if (!loadedOlderNotificationsRef.current) setNotificationHasMore(result.hasMore);
+    } catch {
+      // Inbox polling is best-effort; leave the last successful inbox visible.
+    }
+  }, [accountApi]);
+
+  async function loadOlderNotifications() {
+    const oldest = notifications.at(-1);
+    if (!oldest || !notificationHasMore || loadingOlderNotificationsRef.current) return;
+    loadingOlderNotificationsRef.current = true;
+    setLoadingOlderNotifications(true);
+    const seq = ++notificationSeqRef.current;
+    try {
+      const query = new URLSearchParams({ beforeCreatedAt: oldest.cursorCreatedAt, beforeId: oldest.id });
+      const result = await accountApi<{ notifications: InboxNotification[]; unreadCount: number; hasMore: boolean }>(`/api/notifications?${query}`);
+      if (seq !== notificationSeqRef.current) return;
+      setNotifications((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        for (const item of result.notifications) byId.set(item.id, item);
+        return [...byId.values()].sort((a, b) => b.cursorCreatedAt.localeCompare(a.cursorCreatedAt) || b.id.localeCompare(a.id));
+      });
+      setUnreadCount(result.unreadCount);
+      setNotificationHasMore(result.hasMore);
+      loadedOlderNotificationsRef.current = true;
+    } catch (cause) {
+      if (seq !== notificationSeqRef.current) return;
+      setError(cause instanceof Error ? cause.message : "Could not load older notifications.");
+    } finally {
+      loadingOlderNotificationsRef.current = false;
+      setLoadingOlderNotifications(false);
+    }
+  }
 
   // Single guarded loader. A monotonic sequence number ensures a slow, earlier
   // response can never overwrite data from a newer one (for example a reload
@@ -138,12 +340,12 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     const activeRole = roleRef.current;
     try {
       const [commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult] = await Promise.all([
-        activeRole === "DRIVER" ? api<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
-        api<{ requests: RideRequest[] }>("/api/rides"),
-        activeRole === "DRIVER" ? api<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
-        api<{ activity: ActivityItem[] }>("/api/activity"),
-        api<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
-        api<{ reports: SafetyReport[] }>("/api/reports"),
+        activeRole === "DRIVER" ? accountApi<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
+        accountApi<{ requests: RideRequest[] }>("/api/rides"),
+        activeRole === "DRIVER" ? accountApi<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
+        accountApi<{ activity: ActivityItem[] }>("/api/activity"),
+        accountApi<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
+        accountApi<{ reports: SafetyReport[] }>("/api/reports"),
       ]);
       if (seq !== loadSeqRef.current) return;
       setCommutes(commuteResult.commutes);
@@ -157,7 +359,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
       if (seq !== loadSeqRef.current) return;
       setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
     }
-  }, []);
+  }, [accountApi]);
 
   useEffect(() => {
     roleRef.current = role;
@@ -167,6 +369,34 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     return () => clearTimeout(timer);
   }, [role, loadDashboard]);
 
+  useEffect(() => {
+    return listenForParticipantModeChange(accountId, () => {
+      // Hide mode-specific state while loading the server-rendered mode.
+      hideDashboardAndRedirect("/dashboard");
+    });
+  }, [accountId, hideDashboardAndRedirect]);
+
+  useEffect(() => {
+    return listenForAuthSessionChange((change) => {
+      if (change.accountId === accountId) return;
+      hideDashboardAndRedirect(change.accountId === null ? "/login" : "/dashboard");
+    });
+  }, [accountId, hideDashboardAndRedirect]);
+
+  useEffect(() => {
+    const initialTimer = window.setTimeout(() => { void refreshNotifications(); }, 0);
+    const poll = () => {
+      if (document.visibilityState === "visible") void refreshNotifications();
+    };
+    const interval = window.setInterval(poll, 30_000);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [refreshNotifications]);
+
   async function perform(action: () => Promise<void>, success: string) {
     setBusy(true);
     setError("");
@@ -175,6 +405,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
       await action();
       setNotice(success);
       await loadDashboard();
+      await refreshNotifications();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not complete the request.");
     } finally {
@@ -185,9 +416,8 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
   async function saveCommute(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     await perform(async () => {
-      await api(editingCommute ? `/api/commutes/${editingCommute.id}` : "/api/commutes", {
+      await apiIdempotent(editingCommute ? `/api/commutes/${editingCommute.id}` : "/api/commutes", {
         method: editingCommute ? "PATCH" : "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
         body: JSON.stringify({
           originArea,
           destinationArea,
@@ -226,9 +456,8 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
 
   async function publishTrip(commuteId: string, date: string) {
     await perform(async () => {
-      await api("/api/trips", {
+      await apiIdempotent("/api/trips", {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
         body: JSON.stringify({ commuteTemplateId: commuteId, tripDate: date }),
       });
     }, "Dated trip published.");
@@ -238,9 +467,8 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     const confirmed = window.confirm("Cancel this trip? Pending and accepted seat requests will also be withdrawn.");
     if (!confirmed) return;
     await perform(async () => {
-      await api(`/api/trips/${trip.tripOccurrenceId}`, {
+      await apiIdempotent(`/api/trips/${trip.tripOccurrenceId}`, {
         method: "DELETE",
-        headers: { "Idempotency-Key": idempotencyKey() },
       });
     }, "Trip cancelled. Active seat requests were withdrawn.");
   }
@@ -251,7 +479,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     setError("");
     setNotice("");
     try {
-      const result = await api<{ candidates: Candidate[] }>("/api/commutes/search", {
+      const result = await accountApi<{ candidates: Candidate[] }>("/api/commutes/search", {
         method: "POST",
         body: JSON.stringify({ originArea, destinationArea, tripDate, desiredDeparture: departureTime }),
       });
@@ -266,9 +494,8 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
 
   async function requestSeat(candidate: Candidate) {
     await perform(async () => {
-      await api("/api/rides", {
+      await apiIdempotent("/api/rides", {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
         body: JSON.stringify({ tripOccurrenceId: candidate.tripOccurrenceId }),
       });
     }, "Seat request sent to the driver.");
@@ -276,18 +503,16 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
 
   async function requestAction(requestId: string, action: "accept" | "reject" | "cancel") {
     await perform(async () => {
-      await api(`/api/rides/${requestId}/${action}`, {
+      await apiIdempotent(`/api/rides/${requestId}/${action}`, {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
       });
     }, action === "accept" ? "Seat request accepted." : action === "reject" ? "Seat request declined." : "Your request was cancelled.");
   }
 
   async function confirmCompletion(requestId: string) {
     await perform(async () => {
-      await api(`/api/rides/${requestId}/complete`, {
+      await apiIdempotent(`/api/rides/${requestId}/complete`, {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
       });
     }, "Thanks — your confirmation was recorded.");
   }
@@ -296,12 +521,11 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     const reason = window.prompt("Describe what happened with this trip.");
     if (!reason || !reason.trim()) return;
     await perform(async () => {
-      await api(`/api/rides/${requestId}/dispute`, {
+      await apiIdempotent(`/api/rides/${requestId}/dispute`, {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
         body: JSON.stringify({ reason: reason.trim() }),
       });
-    }, "Your report was recorded for review. It is not an emergency service; no alert is sent automatically.");
+    }, "Your trip concern was recorded. It is not an emergency service and no emergency alert is sent.");
   }
 
   async function setUserBlocked(userId: string, displayName: string, blocked: boolean) {
@@ -310,7 +534,7 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     setError("");
     setNotice("");
     try {
-      await api(`/api/users/${userId}/block`, { method: blocked ? "POST" : "DELETE" });
+      await accountApi(`/api/users/${userId}/block`, { method: blocked ? "POST" : "DELETE" });
       setBlockedUsers((current) => blocked
         ? current.some((user) => user.userId === userId) ? current : [...current, { userId, displayName }]
         : current.filter((user) => user.userId !== userId));
@@ -328,9 +552,8 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     event.preventDefault();
     if (!reportDraft) return;
     await perform(async () => {
-      await api("/api/reports", {
+      await apiIdempotent("/api/reports", {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey() },
         body: JSON.stringify({
           reportedUserId: reportDraft.userId,
           tripOccurrenceId: reportDraft.tripOccurrenceId,
@@ -340,20 +563,58 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
       });
       setReportDraft(null);
       setReportDetails("");
-    }, "Report submitted. It is not an emergency service; no alert is sent automatically.");
+    }, "Report submitted. Active reviewers receive an in-app notice, but reports are not monitored continuously or used for emergency response.");
+  }
+
+  async function markNotificationRead(id?: string) {
+    setError("");
+    try {
+      await accountApi("/api/notifications", {
+        method: "PATCH",
+        body: JSON.stringify(id ? { id } : { markAll: true }),
+      });
+      await refreshNotifications();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update notifications.");
+    }
+  }
+
+  async function viewReportStatus(reportId: string, notificationId: string) {
+    setError("");
+    try {
+      const result = await accountApi<{ reports: SafetyReport[] }>("/api/reports");
+      setMyReports(result.reports);
+      await accountApi("/api/notifications", {
+        method: "PATCH",
+        body: JSON.stringify({ id: notificationId }),
+      });
+      await refreshNotifications();
+      window.setTimeout(() => document.getElementById("my-reports")?.scrollIntoView({ behavior: "smooth" }), 0);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : `Could not load report ${reportId}.`);
+    }
   }
 
   async function deleteAccount(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (deleteConfirm !== "DELETE") return;
-    await perform(async () => {
-      await api("/api/account", {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await accountApi("/api/account", {
         method: "DELETE",
         body: JSON.stringify({ confirm: "DELETE" }),
       });
-      // The session no longer exists; leave the authenticated area entirely.
-      router.replace("/login");
-    }, "Your account has been closed.");
+      // Closure removes the session, so navigate directly without trying to
+      // reload authenticated dashboard data after the successful response.
+      announceAuthSessionChange(null);
+      hideDashboardAndRedirect("/login");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not close your account.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function switchMode(nextMode: ParticipantRole) {
@@ -361,12 +622,14 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
     setBusy(true);
     setError("");
     try {
-      await api("/api/profile/mode", {
+      await accountApi("/api/profile/mode", {
         method: "PATCH",
         body: JSON.stringify({ mode: nextMode }),
       });
+      roleRef.current = nextMode;
       setRole(nextMode);
       setCandidates([]);
+      announceParticipantModeChange(accountId, nextMode);
       setNotice(`Switched to ${nextMode.toLowerCase()} mode.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not switch mode.");
@@ -377,6 +640,10 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
 
   function toggleDay(day: number) {
     setSelectedDays((current) => current.includes(day) ? current.filter((value) => value !== day) : [...current, day].sort());
+  }
+
+  if (sessionChanging) {
+    return <main className={styles.page} aria-live="polite"><p>Updating your session…</p></main>;
   }
 
   return (
@@ -395,6 +662,16 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
       {error && <p className={styles.error} role="alert">{error}</p>}
       {notice && <p className={styles.notice} role="status">{notice}</p>}
 
+      <section className={styles.panel} aria-label="Notification inbox">
+        <div className={styles.item}><h2>Notifications{unreadCount > 0 ? ` · ${unreadCount} unread` : ""}</h2>{unreadCount > 0 && <button className={styles.secondary} onClick={() => void markNotificationRead()} disabled={busy}>Mark all read</button>}</div>
+        <p className={styles.muted}>Updates refresh automatically while this page is open.</p>
+        {notifications.length === 0 ? <p className={styles.muted}>No notifications yet.</p> : notifications.map((notification) => <div className={styles.item} key={notification.id}>
+          <div><strong>{notification.title}{notification.readAt ? "" : " · New"}</strong><p>{notification.body} · {new Date(notification.createdAt).toLocaleString()}</p>{notification.kind === "SAFETY_REPORT_RECEIVED" && <a href="/moderation/reports">Open safety review queue</a>}{notification.kind === "SAFETY_REPORT_STATUS_UPDATED" && <button className={styles.secondary} onClick={() => void viewReportStatus(notification.resourceId, notification.id)}>View my report status</button>}</div>
+          {!notification.readAt && <button className={styles.secondary} onClick={() => void markNotificationRead(notification.id)}>Mark read</button>}
+        </div>)}
+        {notificationHasMore && <button className={styles.secondary} onClick={() => void loadOlderNotifications()} disabled={loadingOlderNotifications}>{loadingOlderNotifications ? "Loading…" : "Load older notifications"}</button>}
+      </section>
+
       <section className={styles.panel}>
         <h2>Your activity</h2>
         <p className={styles.muted}>Trips and requests from both Rider and Driver modes.</p>
@@ -412,14 +689,14 @@ export default function DashboardClient({ initialMode, accountEmail }: { initial
         ))}
         {reportDraft && <form className={styles.form} onSubmit={submitReport}>
           <h3>Report {reportDraft.displayName}</h3>
-          <p className={styles.muted}>Reports are stored for an assigned reviewer. They do not send an alert or provide emergency help.</p>
+          <p className={styles.muted}>Active reviewers receive an in-app notice. The queue is not monitored continuously, and this is not an emergency service.</p>
           <label>Reason<select required value={reportReason} onChange={(event) => setReportReason(event.target.value as SafetyReport["reason"])}><option value="SAFETY_CONCERN">Safety concern</option><option value="HARASSMENT">Harassment</option><option value="MISREPRESENTATION">Misrepresentation</option><option value="OTHER">Other</option></select></label>
           <label>What happened?<textarea required minLength={1} maxLength={2000} rows={4} value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} /></label>
           <div className={styles.inline}><button disabled={busy || reportDetails.trim().length === 0}>Submit report</button><button type="button" className={styles.secondary} disabled={busy} onClick={() => setReportDraft(null)}>Cancel</button></div>
         </form>}
       </section>
 
-      <section className={styles.panel}>
+      <section className={styles.panel} id="my-reports">
         <h2>Your reports</h2>
         {myReports.length === 0 ? <p className={styles.muted}>No reports submitted.</p> : myReports.map((report) => <div className={styles.item} key={report.reportId}><div><strong>{report.reportedName} · {report.reason.replaceAll("_", " ").toLowerCase()}</strong><p>{new Date(report.createdAt).toLocaleString()} · {report.status.replaceAll("_", " ").toLowerCase()}</p></div></div>)}
       </section>

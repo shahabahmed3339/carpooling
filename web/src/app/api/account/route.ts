@@ -16,7 +16,6 @@ export async function DELETE(request: Request): Promise<Response> {
         { status: 400 },
       );
     }
-    const reason = typeof body.reason === "string" ? body.reason : undefined;
-    return Response.json(await deleteOwnAccount({ actor, reason }));
+    return Response.json(await deleteOwnAccount({ actor }));
   });
 }

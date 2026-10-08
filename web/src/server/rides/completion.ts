@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 import { assertActiveCommunityMember } from "@/server/community/access";
 import { inTransaction } from "@/server/db/pool";
+import { addNotification } from "@/server/notifications/inbox";
+import { lockUserActions } from "@/server/users/action-lock";
 import { conflict, forbidden, invalid, notFound } from "@/server/rides/errors";
 import type { PoolClient } from "pg";
 
@@ -56,6 +58,7 @@ export async function confirmTripCompletion(input: {
   idempotencyKey: string;
 }): Promise<CompletionResult> {
   return inTransaction(async (client) => {
+    await lockUserActions(client, [input.actor.userId]);
     const lookup = await client.query<{ trip_occurrence_id: string }>(
       "SELECT trip_occurrence_id FROM ride_requests WHERE id = $1",
       [input.requestId],
@@ -144,6 +147,23 @@ export async function confirmTripCompletion(input: {
     if (!row) throw conflict("REQUEST_NOT_ACTIVE", "This seat request is no longer active.");
 
     if (!(row.rider_confirmed_completion && row.driver_confirmed_completion)) {
+      const wasAlreadyConfirmed = isRider
+        ? request.rider_confirmed_completion
+        : request.driver_confirmed_completion;
+      if (!wasAlreadyConfirmed) {
+        const confirmer = isRider ? "rider" : "driver";
+        await addNotification(client, {
+          communityId: input.actor.communityId,
+          recipientUserId: isRider ? trip.driver_user_id : request.rider_user_id,
+          actorUserId: input.actor.userId,
+          kind: "COMPLETION_CONFIRMED",
+          eventKey: `completion-confirmed:${request.id}:${input.actor.userId}`,
+          title: "Trip completion confirmed",
+          body: `The ${confirmer} confirmed this trip. Please review it in your dashboard.`,
+          resourceType: "RIDE_REQUEST",
+          resourceId: request.id,
+        });
+      }
       return {
         requestId: row.id,
         tripOccurrenceId: trip.id,
@@ -167,6 +187,20 @@ export async function confirmTripCompletion(input: {
     }
 
     await closeTripIfSettled(client, trip.id);
+
+    for (const recipientUserId of [request.rider_user_id, trip.driver_user_id]) {
+      await addNotification(client, {
+        communityId: input.actor.communityId,
+        recipientUserId,
+        actorUserId: input.actor.userId,
+        kind: "TRIP_COMPLETED",
+        eventKey: `trip-completed:${request.id}:${recipientUserId}`,
+        title: "Trip marked complete",
+        body: "Both participants confirmed this trip.",
+        resourceType: "RIDE_REQUEST",
+        resourceId: request.id,
+      });
+    }
 
     return {
       requestId: row.id,
@@ -222,6 +256,7 @@ export async function disputeTripCompletion(input: {
   }
 
   return inTransaction(async (client) => {
+    await lockUserActions(client, [input.actor.userId]);
     const lookup = await client.query<{ trip_occurrence_id: string }>(
       "SELECT trip_occurrence_id FROM ride_requests WHERE id = $1",
       [input.requestId],
@@ -279,6 +314,18 @@ export async function disputeTripCompletion(input: {
       [request.id],
     );
 
+    await addNotification(client, {
+      communityId: input.actor.communityId,
+      recipientUserId: isRider ? trip.driver_user_id : request.rider_user_id,
+      actorUserId: input.actor.userId,
+      kind: "TRIP_DISPUTED",
+      eventKey: `trip-disputed:${request.id}:${input.actor.userId}`,
+      title: "Trip issue reported",
+      body: "The other participant reported a problem with this trip. Review your dashboard.",
+      resourceType: "RIDE_REQUEST",
+      resourceId: request.id,
+    });
+
     return { requestId: request.id, status: "DISPUTED" };
   });
 }
@@ -330,25 +377,60 @@ export async function expireStaleTripsIn(client: PoolClient): Promise<{
   tripsCompleted: number;
   noShowEvidenceRecorded: number;
 }> {
+  // Lock parent trips first, in a stable order, like accept/cancel/account
+  // closure. Bound each dashboard-triggered sweep and let concurrent sweeps
+  // take different batches instead of blocking on the same due trips.
+  const dueTrips = await client.query<{ id: string }>(
+    `SELECT o.id
+       FROM trip_occurrences o
+      WHERE (
+        (o.status = 'OPEN' AND (
+          EXISTS (
+            SELECT 1 FROM ride_requests r
+             WHERE r.trip_occurrence_id = o.id AND r.status = 'ACCEPTED'
+               AND o.departure_at < now() - (SELECT completion_window FROM trip_policy WHERE id = true)
+          )
+          OR (o.departure_at < now() AND NOT EXISTS (
+            SELECT 1 FROM ride_requests r
+             WHERE r.trip_occurrence_id = o.id AND r.status = 'ACCEPTED'
+          ))
+        ))
+        OR (o.status <> 'CANCELLED' AND EXISTS (
+          SELECT 1 FROM ride_requests r
+           WHERE r.trip_occurrence_id = o.id AND r.status = 'REQUESTED'
+             AND o.departure_at <= now()
+        ))
+        )
+      ORDER BY o.id
+      LIMIT 25
+      FOR UPDATE OF o SKIP LOCKED`,
+  );
+  const dueTripIds = dueTrips.rows.map((row) => row.id);
+
   // Capture the confirmation flags as they stood when the window lapsed. The
     // RETURNING clause reports the pre-update values, which is exactly the
     // evidence a no-show policy needs: which side, if any, had confirmed.
     const expired = await client.query<{
       id: string;
       community_id: string;
+      rider_user_id: string;
+      driver_user_id: string;
       rider_confirmed_completion: boolean;
       driver_confirmed_completion: boolean;
       departed_at: Date;
     }>(
       `UPDATE ride_requests r
           SET status = 'EXPIRED', updated_at = now()
-         FROM trip_occurrences o
+        FROM trip_occurrences o
         WHERE o.id = r.trip_occurrence_id
+          AND o.id = ANY($1::uuid[])
           AND r.status = 'ACCEPTED'
           AND o.status = 'OPEN'
           AND o.departure_at < now() - (SELECT completion_window FROM trip_policy WHERE id = true)
-        RETURNING r.id, r.community_id, r.rider_confirmed_completion,
+        RETURNING r.id, r.community_id, r.rider_user_id, o.driver_user_id,
+                  r.rider_confirmed_completion,
                   r.driver_confirmed_completion, o.departure_at AS departed_at`,
+      [dueTripIds],
     );
 
     let noShowEvidenceRecorded = 0;
@@ -368,19 +450,53 @@ export async function expireStaleTripsIn(client: PoolClient): Promise<{
         ],
       );
       noShowEvidenceRecorded += inserted.rowCount ?? 0;
+      for (const recipientUserId of [row.rider_user_id, row.driver_user_id]) {
+        await addNotification(client, {
+          communityId: row.community_id,
+          recipientUserId,
+          actorUserId: null,
+          kind: "COMPLETION_EXPIRED",
+          eventKey: `completion-expired:${row.id}:${recipientUserId}`,
+          title: "Trip confirmation window closed",
+          body: "This trip was not confirmed by both participants before the window closed. Review its status in your dashboard.",
+          resourceType: "RIDE_REQUEST",
+          resourceId: row.id,
+        });
+      }
     }
 
     // A request still pending when the trip departed can never be accepted,
     // completed, or disputed; expire it rather than leaving it actionable.
-    const abandoned = await client.query(
+    const abandoned = await client.query<{
+      id: string;
+      community_id: string;
+      rider_user_id: string;
+      trip_occurrence_id: string;
+    }>(
       `UPDATE ride_requests r
           SET status = 'EXPIRED', updated_at = now()
-         FROM trip_occurrences o
+        FROM trip_occurrences o
         WHERE o.id = r.trip_occurrence_id
+          AND o.id = ANY($1::uuid[])
           AND r.status = 'REQUESTED'
           AND o.status <> 'CANCELLED'
-          AND o.departure_at <= now()`,
+          AND o.departure_at <= now()
+        RETURNING r.id, r.community_id, r.rider_user_id, r.trip_occurrence_id`,
+      [dueTripIds],
     );
+    for (const row of abandoned.rows) {
+      await addNotification(client, {
+        communityId: row.community_id,
+        recipientUserId: row.rider_user_id,
+        actorUserId: null,
+        kind: "COMPLETION_EXPIRED",
+        eventKey: `request-expired:${row.id}`,
+        title: "Seat request expired",
+        body: "The trip departure time passed before the driver responded.",
+        resourceType: "RIDE_REQUEST",
+        resourceId: row.id,
+      });
+    }
     // Every request on these trips has now been expired or completed, so no one
     // holds a seat. Release capacity as the trip closes.
     const trips = await client.query(
@@ -389,11 +505,13 @@ export async function expireStaleTripsIn(client: PoolClient): Promise<{
               seats_reserved = 0,
               updated_at = now()
         WHERE o.status = 'OPEN'
+          AND o.id = ANY($1::uuid[])
           AND o.departure_at < now()
           AND NOT EXISTS (
             SELECT 1 FROM ride_requests r
              WHERE r.trip_occurrence_id = o.id AND r.status = 'ACCEPTED'
           )`,
+      [dueTripIds],
     );
   return {
     requestsExpired: (expired.rowCount ?? 0) + (abandoned.rowCount ?? 0),

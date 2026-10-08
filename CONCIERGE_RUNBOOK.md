@@ -14,7 +14,7 @@ This describes the current product workflow. There is no manual community enroll
 1. Enter approximate pickup area, destination area, desired date, and departure time.
 2. Review matching published trips and request a seat.
 3. The request remains pending until the driver accepts or declines.
-4. Rider may cancel according to the current request state. Show the outcome clearly.
+4. Rider may cancel according to the current request state. Show the outcome clearly. Ride-state changes create inbox notices; the dashboard polls while open, so delivery may be delayed.
 
 ## Driver mode
 
@@ -22,11 +22,11 @@ This describes the current product workflow. There is no manual community enroll
 2. Publish a specific date when actually offering seats; a commute template alone is not a confirmed trip.
 3. Review incoming requests and accept/decline them.
 4. Do not exceed offered capacity. Accepted requests reserve seats transactionally.
-5. A driver may cancel a future trip. The app withdraws its pending and accepted seat requests and removes the trip from search. Users must check their dashboard for the updated status; automated notifications are not implemented.
+5. A driver may cancel a future trip. The app withdraws its pending and accepted seat requests and removes the trip from search. Affected riders receive an in-app notice, but there is no email/SMS/push alert or guarantee anyone sees it promptly.
 
 ## Switching modes
 
-Mode switching changes the dashboard view and available actions. It must not delete or hide ownership of the user's trips and requests. The same account can own driver trips and rider requests; the dashboard may show role-specific lists, with a later UI improvement to expose a unified activity history.
+Mode switching changes the dashboard view and available actions. It must not delete or hide ownership of the user's trips and requests. The same account can own driver trips and rider requests; the dashboard's shared activity view lists both regardless of selected mode.
 
 ## Operational support
 

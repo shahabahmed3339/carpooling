@@ -2,12 +2,14 @@ import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { inTransaction } from "@/server/db/pool";
 import { withIdempotency, type IdempotentResult } from "@/server/db/idempotency";
-import { assertActiveCommunityMember, assertParticipantRole } from "@/server/community/access";
+import { assertActiveCommunityMember, assertCurrentParticipantRole, assertParticipantRole } from "@/server/community/access";
 import { isValidDateOnly } from "@/domain/clock";
 import { conflict, forbidden, invalid, notFound } from "./errors";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 import { lockUserPair } from "@/server/users/blocks";
 import { expireStaleTripsIn } from "@/server/rides/completion";
+import { addNotification } from "@/server/notifications/inbox";
+import { lockUserActions } from "@/server/users/action-lock";
 
 type RequestResult = {
   requestId: string;
@@ -27,6 +29,8 @@ async function usersAreBlocked(
   firstUserId: string,
   secondUserId: string,
 ): Promise<boolean> {
+  // Serialize the read with block/unblock so a concurrent block cannot slip
+  // between this check and creating/accepting the request.
   await lockUserPair(client, firstUserId, secondUserId);
   const result = await client.query(
     `SELECT 1
@@ -56,6 +60,8 @@ export async function requestSeat(input: {
         tripOccurrenceId: input.tripOccurrenceId,
       }),
       work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertCurrentParticipantRole(client, input.actor.userId, "RIDER");
         const trip = await client.query<{
           id: string;
           community_id: string;
@@ -122,6 +128,17 @@ export async function requestSeat(input: {
            VALUES ($1, $2, $3, $4)`,
           [requestId, occurrence.id, occurrence.community_id, input.actor.userId],
         );
+        await addNotification(client, {
+          communityId: occurrence.community_id,
+          recipientUserId: occurrence.driver_user_id,
+          actorUserId: input.actor.userId,
+          kind: "RIDE_REQUESTED",
+          eventKey: `ride-requested:${requestId}`,
+          title: "New seat request",
+          body: "A rider requested a seat. Review the request in your dashboard.",
+          resourceType: "RIDE_REQUEST",
+          resourceId: requestId,
+        });
 
         return {
           status: 201,
@@ -159,6 +176,8 @@ export async function createTripOccurrence(input: {
         tripDate: input.tripDate,
       }),
       work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertCurrentParticipantRole(client, input.actor.userId, "DRIVER");
         const templateResult = await client.query<{
           id: string;
           community_id: string;
@@ -290,6 +309,8 @@ export async function cancelTripOccurrence(input: {
         tripOccurrenceId: input.tripOccurrenceId,
       }),
       work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertCurrentParticipantRole(client, input.actor.userId, "DRIVER");
         const tripResult = await client.query<{
           id: string;
           driver_user_id: string;
@@ -317,8 +338,8 @@ export async function cancelTripOccurrence(input: {
           throw conflict("TRIP_NOT_CANCELLABLE", "A trip can only be cancelled before it departs.");
         }
 
-        const activeRequests = await client.query<{ id: string; status: "REQUESTED" | "ACCEPTED" }>(
-          `SELECT id, status
+        const activeRequests = await client.query<{ id: string; rider_user_id: string; status: "REQUESTED" | "ACCEPTED" }>(
+          `SELECT id, rider_user_id, status
              FROM ride_requests
             WHERE trip_occurrence_id = $1
               AND community_id = $2
@@ -344,6 +365,19 @@ export async function cancelTripOccurrence(input: {
         );
         if (cancelled.rowCount !== 1) {
           throw conflict("TRIP_NOT_CANCELLABLE", "This trip changed. Refresh and try again.");
+        }
+        for (const request of activeRequests.rows) {
+          await addNotification(client, {
+            communityId: input.actor.communityId,
+            recipientUserId: request.rider_user_id,
+            actorUserId: input.actor.userId,
+            kind: "TRIP_CANCELLED",
+            eventKey: `trip-cancelled:${trip.id}:${request.id}`,
+            title: "Trip cancelled",
+            body: "The driver cancelled this trip. Your seat request was withdrawn.",
+            resourceType: "TRIP_OCCURRENCE",
+            resourceId: trip.id,
+          });
         }
 
         return {
@@ -376,6 +410,8 @@ export async function acceptRideRequest(input: {
         requestId: input.requestId,
       }),
       work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertCurrentParticipantRole(client, input.actor.userId, "DRIVER");
         // Read the parent id, then lock in one global order (trip before request)
         // so accept/cancel operations can share a deadlock-safe locking protocol.
         const lookup = await client.query<{ trip_occurrence_id: string }>(
@@ -468,6 +504,17 @@ export async function acceptRideRequest(input: {
         if (accepted.rowCount !== 1) {
           throw conflict("REQUEST_NOT_PENDING", "This request is no longer pending.");
         }
+        await addNotification(client, {
+          communityId: trip.community_id,
+          recipientUserId: request.rider_user_id,
+          actorUserId: input.actor.userId,
+          kind: "RIDE_ACCEPTED",
+          eventKey: `ride-accepted:${request.id}`,
+          title: "Seat request accepted",
+          body: "The driver accepted your seat request. Check the trip in your dashboard.",
+          resourceType: "RIDE_REQUEST",
+          resourceId: request.id,
+        });
 
         return {
           status: 200,
@@ -497,6 +544,8 @@ export async function rejectRideRequest(input: {
       key: input.idempotencyKey,
       requestFingerprint: JSON.stringify({ communityId: input.actor.communityId, requestId: input.requestId }),
       work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertCurrentParticipantRole(client, input.actor.userId, "DRIVER");
         const lookup = await client.query<{ trip_occurrence_id: string }>(
           "SELECT trip_occurrence_id FROM ride_requests WHERE id = $1",
           [input.requestId],
@@ -548,6 +597,17 @@ export async function rejectRideRequest(input: {
             WHERE id = $1 AND status = 'REQUESTED'`,
           [request.id],
         );
+        await addNotification(client, {
+          communityId: trip.community_id,
+          recipientUserId: request.rider_user_id,
+          actorUserId: input.actor.userId,
+          kind: "RIDE_REJECTED",
+          eventKey: `ride-rejected:${request.id}`,
+          title: "Seat request declined",
+          body: "The driver declined your seat request.",
+          resourceType: "RIDE_REQUEST",
+          resourceId: request.id,
+        });
         return { status: 200, body: { requestId: request.id, tripOccurrenceId: trip.id, status: "REJECTED" } };
       },
     }),
@@ -569,6 +629,8 @@ export async function cancelRideRequest(input: {
       key: input.idempotencyKey,
       requestFingerprint: JSON.stringify({ communityId: input.actor.communityId, requestId: input.requestId }),
       work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertCurrentParticipantRole(client, input.actor.userId, "RIDER");
         const lookup = await client.query<{ trip_occurrence_id: string }>(
           "SELECT trip_occurrence_id FROM ride_requests WHERE id = $1",
           [input.requestId],
@@ -579,10 +641,11 @@ export async function cancelRideRequest(input: {
         const tripResult = await client.query<{
           id: string;
           community_id: string;
+          driver_user_id: string;
           status: "OPEN" | "CANCELLED" | "COMPLETED";
           departure_at: Date;
         }>(
-          `SELECT id, community_id, status, departure_at FROM trip_occurrences
+          `SELECT id, community_id, driver_user_id, status, departure_at FROM trip_occurrences
             WHERE id = $1 AND community_id = $2 FOR UPDATE`,
           [tripId, input.actor.communityId],
         );
@@ -626,6 +689,17 @@ export async function cancelRideRequest(input: {
             WHERE id = $1 AND status IN ('REQUESTED', 'ACCEPTED')`,
           [request.id],
         );
+        await addNotification(client, {
+          communityId: trip.community_id,
+          recipientUserId: trip.driver_user_id,
+          actorUserId: input.actor.userId,
+          kind: "RIDE_CANCELLED",
+          eventKey: `ride-cancelled:${request.id}`,
+          title: "Seat request cancelled",
+          body: "A rider withdrew their seat request.",
+          resourceType: "RIDE_REQUEST",
+          resourceId: request.id,
+        });
         return { status: 200, body: { requestId: request.id, tripOccurrenceId: trip.id, status: "CANCELLED" } };
       },
     }),

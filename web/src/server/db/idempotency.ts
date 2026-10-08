@@ -37,7 +37,9 @@ export function validateIdempotencyKey(key: string): void {
 /**
  * Run the business mutation and persist its replay result in the caller's
  * transaction. Concurrent identical keys serialize on the unique key; a retry
- * returns the committed result. Reusing a key with a different payload fails.
+ * returns the committed result for 24 hours. Reusing a key with a different
+ * payload during that window fails; after expiry, the key starts a fresh
+ * operation.
  */
 export async function withIdempotency<T>(args: {
   client: PoolClient;
@@ -53,9 +55,15 @@ export async function withIdempotency<T>(args: {
   const requestHash = sha256(args.requestFingerprint);
   const inserted = await args.client.query(
     `INSERT INTO idempotency_records
-       (actor_user_id, operation, key_sha256, request_sha256, expires_at)
-     VALUES ($1, $2, $3, $4, now() + interval '24 hours')
-     ON CONFLICT (actor_user_id, operation, key_sha256) DO NOTHING
+       (actor_user_id, operation, key_sha256, request_sha256, created_at, expires_at)
+     VALUES ($1, $2, $3, $4, clock_timestamp(), clock_timestamp() + interval '24 hours')
+     ON CONFLICT (actor_user_id, operation, key_sha256) DO UPDATE
+       SET request_sha256 = EXCLUDED.request_sha256,
+           response_status = NULL,
+           response_body = NULL,
+           created_at = clock_timestamp(),
+           expires_at = clock_timestamp() + interval '24 hours'
+       WHERE idempotency_records.expires_at <= clock_timestamp()
      RETURNING actor_user_id`,
     [args.actorUserId, args.operation, keyHash, requestHash],
   );

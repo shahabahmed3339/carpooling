@@ -26,6 +26,9 @@ Keep observed behavior separate from interpretation. Product decisions can follo
 
 - **Status:** DECIDED
 - **Decision:** Closing an account is not a hard delete. The account is deactivated, its display name and auth subject are erased, its membership is released, and its open requests and future trips are cancelled. The row is kept so trips, requests, reports, and idempotency records that reference it remain valid for other participants.
+- **Implementation clarification:** Delete the associated Better Auth identity, linked provider credentials, sessions, and outstanding magic-link tokens for the account email as part of the same transaction. Keep only the app's anonymous historical row.
+- **Consistency detail:** Serialize closure against mutations initiated by that account. When withdrawing accepted rider requests, lock their parent trips first and release the corresponding reserved seats in the same transaction before cancelling future driver trips.
+- **Counterparty update:** Notify affected drivers/riders in-app when account closure withdraws a request or cancels a future trip; notices are written atomically with the closure and do not expose contact details.
 - **Reason:** Hard-deleting the user would either break foreign keys or destroy the other party's record of a shared trip. Privacy is satisfied by erasing identifying fields and preventing sign-in, not by removing the row.
 - **Consequence:** An operator still has no way to distinguish a closed account from any other participant in historical data, which is intended. The retention window for these tombstones is unresolved.
 
@@ -44,6 +47,19 @@ Keep observed behavior separate from interpretation. Product decisions can follo
 - **Decision:** When a completion window lapses, record which side had confirmed (`RIDER_UNCONFIRMED`, `DRIVER_UNCONFIRMED`, `NEITHER_CONFIRMED`, `BOTH_CONFIRMED`) in `trip_no_show_evidence`, preserving the flags as they stood at expiry. Show it to staff as context. Attach no automated consequence to it.
 - **Reason:** "Did not confirm" is a different fact from "did not travel". Conflating them would penalise people for not opening an app, which is a foreseeable and unfair outcome. Recording the raw signal keeps the option open; acting on it automatically would bake in an assumption the data cannot support.
 - **Consequence:** The evidence is currently read-only context for a human. Any no-show *policy* — thresholds, warnings, appeals — is explicitly out of scope and unresolved.
+
+### In-app ride notifications
+
+- **Status:** IMPLEMENTED; external delivery unresolved.
+- **Decision:** Persist recipient-scoped notifications transactionally for ride requests, decisions, cancellations, completion confirmation/expiry, disputes, new safety reports, and report status changes. Stable unique event keys make event creation idempotent; recipients can mark one or all entries read.
+- **Reason:** State changes visible only after a manual reload are easy to miss. Writing the notification in the same transaction avoids notifications for rolled-back changes and missing entries after committed state transitions.
+
+### Safety report action history
+
+- **Decision:** Store report submission and reviewer status changes as append-only audit events, including actor, time, transition, and internal notes. Restrict event reads to active safety reviewers/operators.
+- **Existing records:** Backfill one clearly labeled snapshot of each report's state; do not represent unknown past actions as reconstructed history.
+- **Reason:** The report row stores only current status and notes, so later updates otherwise erase prior review context and accountability.
+- **Limitations:** The client polls while visible and refreshes on focus; this is not real-time. Safety notices are in-app only; there is no email/SMS/push delivery, page/on-call behavior, response-time guarantee, or notification retention/cleanup policy.
 
 ### Real-world readiness
 

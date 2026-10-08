@@ -1,7 +1,18 @@
-import { reviewSafetyReport, type SafetyReportStatus } from "@/server/users/reports";
+import { listSafetyReportEvents, reviewSafetyReport, type SafetyReportStatus } from "@/server/users/reports";
 import { HttpInputError, readJsonObject, requiredString, requireUuid, withActor } from "@/server/http/responses";
 
 const reviewStatuses: Exclude<SafetyReportStatus, "RECEIVED">[] = ["IN_REVIEW", "RESOLVED", "DISMISSED"];
+
+export async function GET(
+  _request: Request,
+  context: { params: Promise<{ reportId: string }> },
+): Promise<Response> {
+  return withActor(async (actor) => {
+    const { reportId: rawReportId } = await context.params;
+    const reportId = requireUuid(rawReportId, "reportId");
+    return Response.json({ events: await listSafetyReportEvents(actor, reportId) });
+  });
+}
 
 export async function PATCH(
   request: Request,

@@ -1,3 +1,4 @@
+import { headers } from "next/headers";
 import {
   AuthenticationDisabledError,
   AuthenticationRequiredError,
@@ -68,35 +69,56 @@ export function requireUuid(value: string, field: string): string {
 export async function withActor(
   operation: (actor: Awaited<ReturnType<typeof requireAuthenticatedActor>>) => Promise<Response>,
 ): Promise<Response> {
+  let actorUserId: string | undefined;
+  let actorParticipantRole: string | undefined;
+  const privateResponse = (response: Response): Response => {
+    // Authenticated API payloads contain account-, trip-, or moderation-specific
+    // data. Prevent browsers and intermediary caches from reusing them across
+    // sessions, including responses that represent errors.
+    response.headers.set("Cache-Control", "private, no-store");
+    if (actorUserId) response.headers.set("X-Carpool-Actor", actorUserId);
+    if (actorParticipantRole) response.headers.set("X-Carpool-Mode", actorParticipantRole);
+    return response;
+  };
+
   try {
-    return await operation(await requireAuthenticatedActor());
+    const expectedActorId = (await headers()).get("X-Expected-Carpool-Actor");
+    const actor = await requireAuthenticatedActor();
+    actorUserId = actor.userId;
+    actorParticipantRole = actor.participantRole;
+    if (expectedActorId && expectedActorId !== actor.userId) {
+      return privateResponse(Response.json({
+        error: { code: "ACCOUNT_SESSION_CHANGED", message: "The signed-in account changed. Reload the page before continuing." },
+      }, { status: 409 }));
+    }
+    return privateResponse(await operation(actor));
   } catch (error) {
     if (error instanceof AuthenticationDisabledError) {
-      return Response.json({ error: { code: "AUTH_DISABLED", message: error.message } }, { status: 503 });
+      return privateResponse(Response.json({ error: { code: "AUTH_DISABLED", message: error.message } }, { status: 503 }));
     }
     if (error instanceof AuthenticationRequiredError) {
-      return Response.json({ error: { code: "AUTH_REQUIRED", message: error.message } }, { status: 401 });
+      return privateResponse(Response.json({ error: { code: "AUTH_REQUIRED", message: error.message } }, { status: 401 }));
     }
     if (error instanceof AccountUnavailableError) {
-      return Response.json({
+      return privateResponse(Response.json({
         error: { code: "ACCOUNT_UNAVAILABLE", message: error.message },
-      }, { status: 403 });
+      }, { status: 403 }));
     }
     if (error instanceof HttpInputError) {
-      return Response.json({
+      return privateResponse(Response.json({
         error: { code: "INVALID_REQUEST", message: error.message },
-      }, { status: 400 });
+      }, { status: 400 }));
     }
     if (error instanceof RideDomainError) {
-      return Response.json({
+      return privateResponse(Response.json({
         error: { code: error.code, message: error.message },
-      }, { status: error.status });
+      }, { status: error.status }));
     }
     if (error instanceof IdempotencyConflictError) {
-      return Response.json({ error: { code: error.code, message: error.message } }, { status: 409 });
+      return privateResponse(Response.json({ error: { code: error.code, message: error.message } }, { status: 409 }));
     }
     console.error("Carpool API request failed.");
-    return Response.json({ error: { code: "INTERNAL_ERROR", message: "The request could not be completed." } }, { status: 500 });
+    return privateResponse(Response.json({ error: { code: "INTERNAL_ERROR", message: "The request could not be completed." } }, { status: 500 }));
   }
 }
 
