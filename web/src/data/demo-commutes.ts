@@ -1,0 +1,80 @@
+import type { CommuteCandidate } from "@/domain/commute";
+
+// Synthetic examples only. Never replace with participant data in demo mode.
+export const demoCommutes: CommuteCandidate[] = [
+  {
+    id: "demo-driver-1",
+    communityId: "demo-community",
+    displayName: "Sample driver A",
+    initials: "SA",
+    originAreaId: "gulberg",
+    originLabel: "Gulberg",
+    destinationAreaId: "dha-phase-5",
+    destinationLabel: "DHA Phase 5",
+    weekdays: [1, 2, 3, 4, 5],
+    departureMinutes: 490,
+    availableSeats: 2,
+    vehicleLabel: "Sedan · sample vehicle",
+    isApproved: true,
+    isActive: true,
+  },
+  {
+    id: "demo-driver-2",
+    communityId: "demo-community",
+    displayName: "Sample driver B",
+    initials: "SB",
+    originAreaId: "gulberg",
+    originLabel: "Gulberg",
+    destinationAreaId: "dha-phase-5",
+    destinationLabel: "DHA Phase 5",
+    weekdays: [1, 3, 5],
+    departureMinutes: 505,
+    availableSeats: 1,
+    vehicleLabel: "Hatchback · sample vehicle",
+    isApproved: true,
+    isActive: true,
+  },
+  {
+    id: "demo-driver-3",
+    communityId: "demo-community",
+    displayName: "Sample driver C",
+    initials: "SC",
+    originAreaId: "model-town",
+    originLabel: "Model Town",
+    destinationAreaId: "dha-phase-5",
+    destinationLabel: "DHA Phase 5",
+    weekdays: [1, 2, 3, 4, 5],
+    departureMinutes: 492,
+    availableSeats: 3,
+    vehicleLabel: "Sedan · sample vehicle",
+    isApproved: true,
+    isActive: true,
+  },
+  {
+    id: "demo-driver-4",
+    communityId: "another-demo-community",
+    displayName: "Sample driver D",
+    initials: "SD",
+    originAreaId: "gulberg",
+    originLabel: "Gulberg",
+    destinationAreaId: "dha-phase-5",
+    destinationLabel: "DHA Phase 5",
+    weekdays: [1, 2, 3, 4, 5],
+    departureMinutes: 488,
+    availableSeats: 2,
+    vehicleLabel: "Sedan · sample vehicle",
+    isApproved: true,
+    isActive: true,
+  },
+];
+
+export const demoViewer = {
+  id: "demo-rider",
+  communityId: "demo-community",
+};
+
+export const demoAreas = [
+  { id: "gulberg", label: "Gulberg" },
+  { id: "model-town", label: "Model Town" },
+  { id: "dha-phase-5", label: "DHA Phase 5" },
+];

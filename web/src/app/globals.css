@@ -1,0 +1,18 @@
+:root {
+  color-scheme: light;
+  background: #fbfcfa;
+  color: #17231f;
+  font-family: Arial, Helvetica, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; margin: 0; }
+body { background: #fbfcfa; }
+button, input, select { font: inherit; }
+button:disabled { opacity: 1; }
+a { color: inherit; text-decoration: none; }
+::selection { color: #123c29; background: #dcefe1; }
