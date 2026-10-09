@@ -40,6 +40,8 @@ Mutation idempotency results are retained for 24 hours. `npm run db:prune-idempo
 
 Old in-app notifications are pruned with `npm run db:prune-notifications`. It removes at most 500 rows per invocation, and only notifications the recipient has already **read** and only once older than the retention window (default 90 days; override with `--retention-days=<n>` or `NOTIFICATION_RETENTION_DAYS`). Unread and recent notices are never eligible. Use `--dry-run` to see the eligible count without deleting. Schedule both cleanup commands periodically.
 
+`npm run health-check` prints a deployment readiness report and exits non-zero on a blocking problem, so it can gate a deploy or be run after one. It verifies that every migration file is applied and its checksum matches, that the required tables and columns exist, that the notification enum has every kind the code can write, that the safety-report append-only guards are installed, that an active community scope and a completion policy exist, and that core data invariants hold. It warns (without failing) when no reviewer is promoted, because then the moderation queue is unreachable.
+
 Retention across the rest of the data is not yet applied anywhere. `npm run db:audit-retention` reports how much closed-account, report, dispute, trip and notification data exists at a given age (e.g. `--as-of-days=90`), so the window can be chosen from real volume. It runs inside a read-only transaction and changes nothing; PostgreSQL rejects any write in that transaction, so it cannot delete by mistake.
 
 Two checks assert behaviour against live data rather than page text:

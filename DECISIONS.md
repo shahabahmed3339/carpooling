@@ -75,6 +75,13 @@ Keep observed behavior separate from interpretation. Product decisions can follo
 - **Reason:** With open signup, an in-app promotion path would let any account grant itself access to other people's reports and disputes. A separate command keeps that a deliberate operator action. Only active accounts can be promoted, so a closed account cannot regain reviewer rights.
 - **Consequence:** A deployment that never runs the command has no reviewer and no one can see the moderation queue — an operational step, not a bug. **The command was itself broken until it was tested**: its lookup selected `"user"."userId"`, but that table's primary key is `id` (`userId` exists only on `account`/`session`), so every run failed and no reviewer could be promoted. Verified and fixed; the README's equivalent SQL snippet had the same mistake.
 
+### Readiness is checked, not assumed
+
+- **Status:** IMPLEMENTED as `npm run health-check`; not a monitoring or recovery system.
+- **Decision:** Provide a command that verifies a deployment can operate — migrations applied and checksum-matched, required tables/columns, every notification kind the code writes, the append-only guards, an active scope, a completion policy, and four data invariants — and exits non-zero on a blocking problem.
+- **Reason:** A connected database is not the same as a working app. Two failures found in this project were exactly this shape: `set-reviewer-role` was broken so no reviewer could exist, and a dropped guard would silently remove append-only protection. Both are invisible from a health endpoint that only checks connectivity.
+- **Consequence:** A missing reviewer is a warning rather than a failure — a fresh development database legitimately has none — but on a deployment with reports arriving it means the moderation queue is unreachable, so it is reported. This does not monitor, alert, or recover; it only answers "is this deployment ready" when run.
+
 ### Area equivalence is declared, never guessed
 
 - **Status:** IMPLEMENTED (migration 0022).

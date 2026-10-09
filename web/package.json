@@ -11,6 +11,7 @@
     "db:prune-idempotency": "node ./scripts/prune-idempotency.mjs",
     "db:prune-notifications": "node ./scripts/prune-notifications.mjs",
     "db:audit-retention": "node ./scripts/audit-retention.mjs",
+    "health-check": "node ./scripts/health-check.mjs",
     "db:set-reviewer-role": "node ./scripts/set-reviewer-role.mjs",
     "verify:dispute": "node ./scripts/verify-dispute.mjs",
     "verify:account-closure": "node ./scripts/verify-account-closure.mjs",
