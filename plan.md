@@ -42,7 +42,7 @@ Keep the first release to authentication, mode switching, commute templates, dat
 2. Configure auth secret, base URL, email sender/provider, and `AUTH_ENABLED=true`; test local email links through the development terminal only on localhost.
 3. Create two test accounts. Verify Rider-to-Driver and Driver-to-Rider switching, then exercise a dated trip from the two accounts.
 4. Verify the same user can keep their own driver trips and rider requests after switching. Confirm authorization is enforced server-side, not just by hiding UI.
-5. Verify ride and safety-report notifications across two browser sessions, including reviewer and reporter inbox delivery, read state, and major ride transitions. Verify the reviewer-only report history, the open-dispute queue and both resolution outcomes, and queue refresh. The configured database has migrations `0001` through `0023` applied.
+5. Verify ride and safety-report notifications across two browser sessions, including reviewer and reporter inbox delivery, read state, and major ride transitions. Verify the reviewer-only report history, the open-dispute queue and both resolution outcomes, and queue refresh. The configured database has migrations `0001` through `0024` applied.
 6. Resolve operational policies before production or real rides: a staffed report queue and escalation path, support contact, cancellation/no-show rules, data retention/deletion, and an incident response owner. In-app notices do not page staff or provide emergency response.
 
 ## Decision rule

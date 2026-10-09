@@ -173,8 +173,9 @@ export async function confirmTripCompletion(input: {
       };
     }
 
-    // Both confirmed: close the request. The DB CHECK enforces that COMPLETED
-    // always carries completed_at and both flags.
+    // Both confirmed: close the request. Migration 0024 enforces that COMPLETED
+    // always carries completed_at and both flags; before it, the constraint only
+    // required accepted_at, so a one-sided COMPLETED could exist (and two did).
     const completed = await client.query<{ id: string }>(
       `UPDATE ride_requests
           SET status = 'COMPLETED', completed_at = now(), updated_at = now()

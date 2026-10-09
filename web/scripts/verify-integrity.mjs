@@ -65,6 +65,17 @@ try {
       WHERE resolved_at IS NOT NULL AND resolution IS NULL LIMIT 5`,
   );
 
+  // A request only becomes COMPLETED when both sides confirmed. Migration 0024
+  // makes that a database constraint, so a one-sided COMPLETED cannot exist;
+  // this is the check that would have caught the rows it repaired.
+  await sql(
+    "no request is COMPLETED without both confirmations",
+    `SELECT id FROM ride_requests
+      WHERE status = 'COMPLETED'
+        AND (rider_confirmed_completion = false OR driver_confirmed_completion = false OR completed_at IS NULL)
+      LIMIT 5`,
+  );
+
   // --- Notifications ------------------------------------------------------
   // Every notice must name a recipient that still exists and belong to the same
   // community as the row it describes. A dangling recipient would be invisible

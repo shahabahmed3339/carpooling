@@ -75,6 +75,13 @@ Keep observed behavior separate from interpretation. Product decisions can follo
 - **Reason:** With open signup, an in-app promotion path would let any account grant itself access to other people's reports and disputes. A separate command keeps that a deliberate operator action. Only active accounts can be promoted, so a closed account cannot regain reviewer rights.
 - **Consequence:** A deployment that never runs the command has no reviewer and no one can see the moderation queue — an operational step, not a bug. **The command was itself broken until it was tested**: its lookup selected `"user"."userId"`, but that table's primary key is `id` (`userId` exists only on `account`/`session`), so every run failed and no reviewer could be promoted. Verified and fixed; the README's equivalent SQL snippet had the same mistake.
 
+### COMPLETED means both sides confirmed, and the database now enforces it
+
+- **Status:** IMPLEMENTED (migration 0024). Found by extending `verify-completion` after a health check.
+- **Decision:** A `COMPLETED` request must carry both `rider_confirmed_completion` and `driver_confirmed_completion`, enforced by a database constraint rather than only by application code.
+- **Reason:** The intended rule was that a request completes only when both sides confirm, but the constraint only required `accepted_at IS NOT NULL`, so a one-sided `COMPLETED` was storable — and two such rows existed. Application code even claimed the database enforced it. A one-sided completion is exactly the fact a dispute turns on: it asserts the trip happened with the agreement of someone who never gave it.
+- **Consequence:** The two violating rows were corrected to `EXPIRED` with `completed_at` cleared — the state a one-sided confirmation should have reached — rather than inventing a confirmation nobody gave. A one-sided `COMPLETED` is now rejected by the database and a genuine one accepted, both verified directly.
+
 ### Readiness is checked, not assumed
 
 - **Status:** IMPLEMENTED as `npm run health-check`; not a monitoring or recovery system.
