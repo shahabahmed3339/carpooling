@@ -19,6 +19,8 @@
     "verify:contribution": "node ./scripts/verify-contribution.mjs",
     "verify:integrity": "node ./scripts/verify-integrity.mjs",
     "verify:reviewer-role": "node ./scripts/verify-reviewer-role.mjs",
+    "verify:area-alias": "node ./scripts/verify-area-alias.mjs",
+    "verify:support": "node ./scripts/verify-support.mjs",
     "verify:area-alias": "node ./scripts/verify-area-alias.mjs"
   },
   "dependencies": {

@@ -30,7 +30,7 @@ For hosted/non-local environments, configure a verified email sender with `RESEN
 
 ## Database
 
-Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note. Do not run migrations against a shared/production database unless that is the intended operation.
+Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community. Do not run migrations against a shared/production database unless that is the intended operation.
 
 If a migration file is edited after it was applied, the runner refuses to continue (it would silently apply a different schema than the database holds). After verifying the live schema by hand, reconcile only that file with `node ./scripts/migrate.mjs --rebaseline-checksum=<filename>`; it records the new checksum and does not re-run any SQL. Use it deliberately, and prefer a new migration whenever the change is not purely documentary.
 
@@ -55,7 +55,10 @@ node scripts/verify-contribution.mjs     # cost-sharing note copy-on-publish rul
 node scripts/verify-integrity.mjs        # cross-table integrity for disputes/reports/closure (read-only)
 node scripts/verify-reviewer-role.mjs    # reviewer-role grant/refuse paths (self-cleaning)
 node scripts/verify-area-alias.mjs       # area-alias resolution and matching (self-cleaning)
+node scripts/verify-support.mjs          # support-contact read/write and operator gate (self-cleaning)
 ```
+
+`npm run db:audit-retention` reports aged data volumes read-only, so a retention window can be chosen from real numbers.
 
 To review reports and disputes, promote an account with the bundled command after it has signed in once:
 
@@ -71,4 +74,4 @@ This implementation supports local product-flow testing. It does not verify iden
 
 Not implemented: no-show *policy*. Unconfirmed completions are recorded and shown to reviewers, but nothing acts on them — there is no threshold, warning, suspension, or appeal path, so the data must currently be read as context during a human review rather than as a determination. Trip disputes have a human review path but equally carry no automatic consequence. In-app notifications are periodic rather than real-time, and external alert channels are not configured.
 
-Before facilitating real rides, complete a staffed support route, a retention schedule for closed accounts and reports, cancellation/no-show/cost-sharing terms, incident response, and applicable local review. See repository-level `MVP_SPEC.md` and `SAFETY_PRIVACY.md`.
+Before facilitating real rides, complete a staffed support route, a retention schedule for closed accounts and reports, cancellation/no-show/cost-sharing terms, incident response, and applicable local review. See repository-level `MVP_SPEC.md` and `SAFETY_PRIVACY.md`. An operator can publish a support contact and hours in the app (`/api/support`, shown on the dashboard), but publishing text is not the same as staffing it: someone must still answer.

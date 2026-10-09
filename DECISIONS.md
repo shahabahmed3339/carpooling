@@ -75,6 +75,20 @@ Keep observed behavior separate from interpretation. Product decisions can follo
 - **Reason:** With open signup, an in-app promotion path would let any account grant itself access to other people's reports and disputes. A separate command keeps that a deliberate operator action. Only active accounts can be promoted, so a closed account cannot regain reviewer rights.
 - **Consequence:** A deployment that never runs the command has no reviewer and no one can see the moderation queue — an operational step, not a bug. **The command was itself broken until it was tested**: its lookup selected `"user"."userId"`, but that table's primary key is `id` (`userId` exists only on `account`/`session`), so every run failed and no reviewer could be promoted. Verified and fixed; the README's equivalent SQL snippet had the same mistake.
 
+### Area equivalence is declared, never guessed
+
+- **Status:** IMPLEMENTED (migration 0022).
+- **Decision:** An operator may declare that one area name is equivalent to another via `area_aliases`; both spellings then match each other in search. The app never infers that two different names are "nearby".
+- **Reason:** Text normalization already handled case and spacing, but a rider searching "Gulberg" still missed a driver who wrote "Gulberg III". Guessing proximity from names would silently widen matching in ways users cannot see or correct, and a wrong guess pairs strangers who think they agreed on a meeting area. An explicit, operator-visible alias keeps equivalence auditable.
+- **Consequence:** Aliases are managed through the moderation page and are reviewer-only. The database rejects a self-alias and a duplicate alias for the same area, and the service rejects cycles so resolution stays deterministic.
+
+### Support contact is published, not staffed
+
+- **Status:** IMPLEMENTED (migration 0023); staffing remains unresolved.
+- **Decision:** An operator can store a support contact and hours on the community; every active member can read it and it is shown on the dashboard. Writes are operator-only.
+- **Reason:** A report with no way to reach a person is a dead end. Making the contact visible in the app is the smallest honest step: it does not claim a response time and does not pretend the app monitors anything.
+- **Consequence:** The text is display-only. The app still sends no alert and provides no emergency response, so publishing a contact is not the same as someone answering it — that is a staffing decision, not a code change.
+
 ### Seat overbooking is guarded twice, deliberately
 
 - **Status:** VERIFIED by `npm run verify:concurrency`.

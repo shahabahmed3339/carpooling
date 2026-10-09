@@ -14,6 +14,13 @@ import { Pool } from "pg";
 
 const { loadEnvConfig } = nextEnv;
 loadEnvConfig(process.cwd(), true, { info: () => {}, error: () => {} });
+if (!process.env.DATABASE_URL) {
+  // loadEnvConfig reads .env.local from the current directory, so running this
+  // from the repository root silently finds no DATABASE_URL. Say so plainly
+  // instead of failing on `new URL(undefined)`.
+  console.error("verify-integrity must run from web/ (it reads web/.env.local). cd web && node scripts/verify-integrity.mjs");
+  process.exit(1);
+}
 const url = new URL(process.env.DATABASE_URL);
 url.searchParams.delete("sslmode");
 const pool = new Pool({
@@ -163,6 +170,43 @@ try {
        LEFT JOIN communities c ON c.id = m.community_id WHERE c.id IS NULL LIMIT 5`,
   );
 
+  // --- Area aliases -------------------------------------------------------
+  // An alias is what makes two spellings match, so a broken row silently widens
+  // or narrows matching for everyone in the scope. The schema forbids self-
+  // aliases, so the checks here are the ones it cannot express.
+  await sql(
+    "every area alias belongs to an existing community",
+    `SELECT a.alias_area FROM area_aliases a
+       LEFT JOIN communities c ON c.id = a.community_id WHERE c.id IS NULL LIMIT 5`,
+  );
+  await sql(
+    "no alias points at itself",
+    `SELECT alias_area FROM area_aliases WHERE alias_area = canonical_area LIMIT 5`,
+  );
+  await sql(
+    "no alias is unnormalized (blank or untrimmed)",
+    `SELECT alias_area FROM area_aliases
+      WHERE alias_area <> lower(regexp_replace(trim(alias_area), '[[:space:]]+', ' ', 'g'))
+         OR canonical_area <> lower(regexp_replace(trim(canonical_area), '[[:space:]]+', ' ', 'g'))
+      LIMIT 5`,
+  );
+  // A cycle (a -> b -> a) would make resolution non-deterministic: the service
+  // rejects it and this confirms none slipped in. Also covers an alias that
+  // shadows another alias's canonical, which is the same shape.
+  await sql(
+    "no alias chain forms a cycle",
+    `SELECT a1.alias_area FROM area_aliases a1
+       JOIN area_aliases a2
+         ON a2.community_id = a1.community_id AND a2.alias_area = a1.canonical_area
+      LIMIT 5`,
+  );
+
+  // --- Support contact ----------------------------------------------------
+  // A blank support contact cannot exist: the schema CHECK forbids it. Re-checking
+  // that here would be a vacuously-true check, so this target is deliberately
+  // skipped. The length ceiling is likewise enforced by the schema, and the
+  // trim-to-NULL behaviour is covered by `npm run verify:support`.
+
   const summary = await pool.query(`
     SELECT
       (SELECT count(*)::int FROM users WHERE status = 'ACTIVE') AS active_users,
@@ -171,7 +215,9 @@ try {
       (SELECT count(*)::int FROM ride_requests) AS requests,
       (SELECT count(*)::int FROM trip_disputes WHERE resolved_at IS NULL) AS open_disputes,
       (SELECT count(*)::int FROM safety_reports WHERE status IN ('RECEIVED','IN_REVIEW')) AS open_reports,
-      (SELECT count(*)::int FROM in_app_notifications) AS notifications`);
+      (SELECT count(*)::int FROM in_app_notifications) AS notifications,
+      (SELECT count(*)::int FROM area_aliases) AS area_aliases,
+      (SELECT count(*)::int FROM communities WHERE support_contact IS NOT NULL) AS communities_with_support`);
   console.log("\nSummary:", JSON.stringify(summary.rows[0]));
 } catch (error) {
   console.error("verify-integrity failed:", error.message);
