@@ -18,7 +18,8 @@
     "verify:concurrency": "node ./scripts/verify-concurrency.mjs",
     "verify:contribution": "node ./scripts/verify-contribution.mjs",
     "verify:integrity": "node ./scripts/verify-integrity.mjs",
-    "verify:reviewer-role": "node ./scripts/verify-reviewer-role.mjs"
+    "verify:reviewer-role": "node ./scripts/verify-reviewer-role.mjs",
+    "verify:area-alias": "node ./scripts/verify-area-alias.mjs"
   },
   "dependencies": {
     "@next/env": "16.4.0",

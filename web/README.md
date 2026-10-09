@@ -54,6 +54,7 @@ node scripts/verify-concurrency.mjs      # parallel accepts, double-accept, acce
 node scripts/verify-contribution.mjs     # cost-sharing note copy-on-publish rules (self-cleaning)
 node scripts/verify-integrity.mjs        # cross-table integrity for disputes/reports/closure (read-only)
 node scripts/verify-reviewer-role.mjs    # reviewer-role grant/refuse paths (self-cleaning)
+node scripts/verify-area-alias.mjs       # area-alias resolution and matching (self-cleaning)
 ```
 
 To review reports and disputes, promote an account with the bundled command after it has signed in once:

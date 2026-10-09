@@ -68,8 +68,13 @@ export async function searchRideCandidates(input: {
                 $2::uuid AS viewer_id,
                 $3::date AS trip_date,
                 $4::time AS desired_departure,
-                $5::text AS origin_area,
-                $6::text AS destination_area,
+                -- Resolve each side through the operator's explicit alias table.
+                -- One hop only: an alias maps to a canonical area, and a
+                -- canonical area is never itself an alias (enforced on insert).
+                COALESCE((SELECT a.canonical_area FROM area_aliases a
+                           WHERE a.community_id = $1 AND a.alias_area = $5), $5) AS origin_area,
+                COALESCE((SELECT a.canonical_area FROM area_aliases a
+                           WHERE a.community_id = $1 AND a.alias_area = $6), $6) AS destination_area,
                 $7::integer AS tolerance_minutes,
                 (extract(hour FROM $4::time)::integer * 60
                   + extract(minute FROM $4::time)::integer) AS desired_minute
@@ -121,8 +126,14 @@ export async function searchRideCandidates(input: {
           AND t.role IN ('OFFERING', 'EITHER')
           AND t.seats_offered > 0
           AND t.owner_user_id <> s.viewer_id
-          AND lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = s.origin_area
-          AND lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = s.destination_area
+          AND lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                (SELECT a.canonical_area FROM area_aliases a
+                  WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g'))),
+                s.origin_area)
+          AND lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                (SELECT a.canonical_area FROM area_aliases a
+                  WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
+                s.destination_area)
           AND abs(candidate.local_departure_minute - s.desired_minute) <= s.tolerance_minutes
           AND NOT EXISTS (
             SELECT 1 FROM user_blocks b

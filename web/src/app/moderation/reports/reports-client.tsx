@@ -53,6 +53,14 @@ type TripDispute = {
   hasNoShowEvidence: boolean;
 };
 
+type AreaAlias = {
+  id: string;
+  aliasArea: string;
+  canonicalArea: string;
+  note: string | null;
+  createdAt: string;
+};
+
 type ApiError = { error?: { code?: string; message?: string } };
 
 async function api<T>(
@@ -94,6 +102,9 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
   const [closedReports, setClosedReports] = useState<Report[]>([]);
   const [evidence, setEvidence] = useState<NoShowEvidence[]>([]);
   const [disputes, setDisputes] = useState<TripDispute[]>([]);
+  const [aliases, setAliases] = useState<AreaAlias[]>([]);
+  const [supportDraft, setSupportDraft] = useState({ contact: "", hours: "" });
+  const [aliasDraft, setAliasDraft] = useState({ aliasArea: "", canonicalArea: "", note: "" });
   const [disputeNotes, setDisputeNotes] = useState<Record<string, string>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
@@ -114,6 +125,7 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
       setEvidence([]);
       setDisputes([]);
       setDisputeNotes({});
+      setAliases([]);
       setNotes({});
       setHistory({});
       setHistoryVisibleId("");
@@ -132,16 +144,23 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
   const reload = useCallback(async () => {
     if (!accessValidRef.current) return;
     const seq = ++queueSeqRef.current;
-    const [reportResult, evidenceResult, disputeResult] = await Promise.all([
+    const [reportResult, evidenceResult, disputeResult, aliasResult, supportResult] = await Promise.all([
       api<{ reports: Report[]; closedReports: Report[] }>("/api/moderation/reports", accountId, clearSensitiveStateAndRedirect),
       api<{ evidence: NoShowEvidence[] }>("/api/moderation/no-shows", accountId, clearSensitiveStateAndRedirect),
       api<{ disputes: TripDispute[] }>("/api/moderation/disputes", accountId, clearSensitiveStateAndRedirect),
+      api<{ aliases: AreaAlias[] }>("/api/area-aliases", accountId, clearSensitiveStateAndRedirect),
+      api<{ support: { contact: string | null; hours: string | null } }>("/api/support", accountId, clearSensitiveStateAndRedirect),
     ]);
     if (!accessValidRef.current || seq !== queueSeqRef.current) return;
     setReports(reportResult.reports);
     setClosedReports(reportResult.closedReports);
     setEvidence(evidenceResult.evidence);
     setDisputes(disputeResult.disputes);
+    setAliases(aliasResult.aliases);
+    setSupportDraft({
+      contact: supportResult.support.contact ?? "",
+      hours: supportResult.support.hours ?? "",
+    });
   }, [accountId, clearSensitiveStateAndRedirect]);
 
   useEffect(() => {
@@ -196,6 +215,67 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
       await reload();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not resolve the dispute.");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function saveSupport() {
+    setError("");
+    setNotice("");
+    setBusyId("support");
+    try {
+      await api("/api/support", accountId, clearSensitiveStateAndRedirect, {
+        method: "PATCH",
+        body: JSON.stringify({ contact: supportDraft.contact, hours: supportDraft.hours }),
+      });
+      if (!accessValidRef.current) return;
+      setNotice("Support contact saved.");
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save the support contact.");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function addAlias() {
+    setError("");
+    setNotice("");
+    const aliasArea = aliasDraft.aliasArea.trim();
+    const canonicalArea = aliasDraft.canonicalArea.trim();
+    if (!aliasArea || !canonicalArea) {
+      setError("Both the alias area and the canonical area are required.");
+      return;
+    }
+    setBusyId("new-alias");
+    try {
+      await api("/api/area-aliases", accountId, clearSensitiveStateAndRedirect, {
+        method: "POST",
+        body: JSON.stringify({ aliasArea, canonicalArea, note: aliasDraft.note }),
+      });
+      if (!accessValidRef.current) return;
+      setAliasDraft({ aliasArea: "", canonicalArea: "", note: "" });
+      setNotice("Area alias added.");
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not add the alias.");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function removeAlias(aliasId: string) {
+    setError("");
+    setNotice("");
+    setBusyId(aliasId);
+    try {
+      await api(`/api/area-aliases/${aliasId}`, accountId, clearSensitiveStateAndRedirect, { method: "DELETE" });
+      if (!accessValidRef.current) return;
+      setNotice("Area alias removed.");
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not remove the alias.");
     } finally {
       setBusyId("");
     }
@@ -291,6 +371,44 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
           <button className={styles.secondary} disabled={busyId === dispute.disputeId} onClick={() => void resolveDispute(dispute.disputeId, "TRIP_NOT_COMPLETED")}>Trip did not happen — mark not completed</button>
         </div>
       </article>)}
+    </section>
+
+    <section className={styles.panel}>
+      <h2>Support contact</h2>
+      <p className={styles.muted}>
+        Shown to every signed-in member so they have somewhere to go when something goes wrong. Whatever you enter
+        here is displayed verbatim; the app does not deliver, queue, or escalate messages, so only publish a channel
+        you actually monitor. Leaving it empty tells members no contact has been published.
+      </p>
+      <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void saveSupport(); }}>
+        <label>Contact<input maxLength={200} value={supportDraft.contact} onChange={(event) => setSupportDraft((current) => ({ ...current, contact: event.target.value }))} placeholder="e.g. support@example.com" /></label>
+        <label>Hours or availability<input maxLength={200} value={supportDraft.hours} onChange={(event) => setSupportDraft((current) => ({ ...current, hours: event.target.value }))} placeholder="e.g. Weekdays 09:00–18:00 PKT" /></label>
+        <button disabled={busyId === "support"}>Save support contact</button>
+      </form>
+    </section>
+
+    <section className={styles.panel}>
+      <h2>Area aliases</h2>
+      <p className={styles.muted}>
+        Areas are matched by exact spelling, so “Gulberg” and “Gulberg III” never match on their own. Adding an
+        alias declares that two spellings mean the same place. Nothing is inferred from similarity or distance, so
+        only add an alias you are confident about: a wrong one can match riders to the wrong trip.
+      </p>
+      <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void addAlias(); }}>
+        <label>Alias area<input maxLength={120} value={aliasDraft.aliasArea} onChange={(event) => setAliasDraft((current) => ({ ...current, aliasArea: event.target.value }))} placeholder="e.g. Gulberg III" /></label>
+        <label>Same place as<input maxLength={120} value={aliasDraft.canonicalArea} onChange={(event) => setAliasDraft((current) => ({ ...current, canonicalArea: event.target.value }))} placeholder="e.g. Gulberg" /></label>
+        <label>Note (optional)<input maxLength={200} value={aliasDraft.note} onChange={(event) => setAliasDraft((current) => ({ ...current, note: event.target.value }))} /></label>
+        <button disabled={busyId === "new-alias"}>Add alias</button>
+      </form>
+      {aliases.length === 0 ? <p className={styles.muted}>No aliases yet.</p> : aliases.map((area) => (
+        <div className={styles.item} key={area.id}>
+          <div>
+            <strong>{area.aliasArea} → {area.canonicalArea}</strong>
+            <p>{area.note ? `${area.note} · ` : ""}Added {new Date(area.createdAt).toLocaleString()}</p>
+          </div>
+          <button className={styles.danger} disabled={busyId === area.id} onClick={() => void removeAlias(area.id)}>Remove</button>
+        </div>
+      ))}
     </section>
 
     <section className={styles.panel}>

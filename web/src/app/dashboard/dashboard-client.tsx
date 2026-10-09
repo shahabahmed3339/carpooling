@@ -222,6 +222,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   const [blockedUsers, setBlockedUsers] = useState<{ userId: string; displayName: string }[]>([]);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [myReports, setMyReports] = useState<SafetyReport[]>([]);
+  const [support, setSupport] = useState<{ contact: string | null; hours: string | null }>({ contact: null, hours: null });
   const [notifications, setNotifications] = useState<InboxNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [notificationHasMore, setNotificationHasMore] = useState(false);
@@ -345,13 +346,14 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
     const seq = ++loadSeqRef.current;
     const activeRole = roleRef.current;
     try {
-      const [commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult] = await Promise.all([
+      const [commuteResult, requestResult, tripResult, activityResult, blockResult, reportResult, supportResult] = await Promise.all([
         activeRole === "DRIVER" ? accountApi<{ commutes: Commute[] }>("/api/commutes") : Promise.resolve({ commutes: [] }),
         accountApi<{ requests: RideRequest[] }>("/api/rides"),
         activeRole === "DRIVER" ? accountApi<{ trips: DriverTrip[] }>("/api/trips") : Promise.resolve({ trips: [] }),
         accountApi<{ activity: ActivityItem[] }>("/api/activity"),
         accountApi<{ blocks: { userId: string; displayName: string }[] }>("/api/blocks"),
         accountApi<{ reports: SafetyReport[] }>("/api/reports"),
+        accountApi<{ support: { contact: string | null; hours: string | null } }>("/api/support"),
       ]);
       if (seq !== loadSeqRef.current) return;
       setCommutes(commuteResult.commutes);
@@ -360,6 +362,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       setActivity(activityResult.activity);
       setBlockedUsers(blockResult.blocks);
       setMyReports(reportResult.reports);
+      setSupport(supportResult.support);
       setError("");
     } catch (cause) {
       if (seq !== loadSeqRef.current) return;
@@ -719,6 +722,16 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       <section className={styles.panel} id="my-reports">
         <h2>Your reports</h2>
         {myReports.length === 0 ? <p className={styles.muted}>No reports submitted.</p> : myReports.map((report) => <div className={styles.item} key={report.reportId}><div><strong>{report.reportedName} · {report.reason.replaceAll("_", " ").toLowerCase()}</strong><p>{new Date(report.createdAt).toLocaleString()} · {report.status.replaceAll("_", " ").toLowerCase()}</p></div></div>)}
+        <div className={styles.item}>
+          <div>
+            <strong>Need help from a person?</strong>
+            {support.contact ? (
+              <p>{support.contact}{support.hours ? ` · ${support.hours}` : ""}</p>
+            ) : (
+              <p className={styles.muted}>No support contact has been published yet. Reports and blocking still work; this app does not provide emergency response.</p>
+            )}
+          </div>
+        </div>
       </section>
 
       <section className={styles.panel}>
