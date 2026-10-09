@@ -13,16 +13,15 @@
     "db:audit-retention": "node ./scripts/audit-retention.mjs",
     "health-check": "node ./scripts/health-check.mjs",
     "db:set-reviewer-role": "node ./scripts/set-reviewer-role.mjs",
-    "verify:dispute": "node ./scripts/verify-dispute.mjs",
-    "verify:account-closure": "node ./scripts/verify-account-closure.mjs",
+    "verify:dispute": "node --experimental-transform-types --import ./scripts/lib/register.mjs ./scripts/verify-dispute.mjs",
+    "verify:account-closure": "node --experimental-transform-types --import ./scripts/lib/register.mjs ./scripts/verify-account-closure.mjs",
     "verify:notifications": "node ./scripts/verify-notifications.mjs",
     "verify:concurrency": "node ./scripts/verify-concurrency.mjs",
     "verify:contribution": "node ./scripts/verify-contribution.mjs",
     "verify:integrity": "node ./scripts/verify-integrity.mjs",
     "verify:reviewer-role": "node ./scripts/verify-reviewer-role.mjs",
     "verify:area-alias": "node ./scripts/verify-area-alias.mjs",
-    "verify:support": "node ./scripts/verify-support.mjs",
-    "verify:area-alias": "node ./scripts/verify-area-alias.mjs"
+    "verify:support": "node ./scripts/verify-support.mjs"
   },
   "dependencies": {
     "@next/env": "16.4.0",

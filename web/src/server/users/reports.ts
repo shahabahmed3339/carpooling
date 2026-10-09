@@ -487,7 +487,7 @@ export async function resolveTripDispute(input: {
       [found.trip_occurrence_id, input.actor.communityId],
     );
 
-    const disputeResult = await client.query<{ id: string; request_id: string; resolved_at: Date | null }>(
+    const disputeResult = await client.query<{ id: string; ride_request_id: string; resolved_at: Date | null }>(
       `SELECT id, ride_request_id, resolved_at
          FROM trip_disputes
         WHERE id = $1 AND community_id = $2
@@ -502,7 +502,7 @@ export async function resolveTripDispute(input: {
          FROM ride_requests
         WHERE id = $1
         FOR UPDATE`,
-      [dispute.request_id],
+      [dispute.ride_request_id],
     );
     const request = requestResult.rows[0];
     if (!request) throw notFound();
@@ -544,6 +544,13 @@ export async function resolveTripDispute(input: {
       `UPDATE ride_requests
           SET status = $3::ride_request_status,
               completed_at = CASE WHEN $3::ride_request_status = 'COMPLETED' THEN COALESCE(completed_at, clock_timestamp()) ELSE completed_at END,
+              -- A reviewer deciding the trip happened is the authority on that
+              -- fact for both sides. The completed-requires-both-confirmations
+              -- CHECK only permits COMPLETED when both flags are set, and a
+              -- disputed row normally has neither participant's self-confirmation;
+              -- the reviewer's determination stands in for both of them.
+              rider_confirmed_completion = CASE WHEN $3::ride_request_status = 'COMPLETED' THEN true ELSE rider_confirmed_completion END,
+              driver_confirmed_completion = CASE WHEN $3::ride_request_status = 'COMPLETED' THEN true ELSE driver_confirmed_completion END,
               updated_at = clock_timestamp()
         WHERE id = $1 AND status = 'DISPUTED'
           AND trip_occurrence_id = $2

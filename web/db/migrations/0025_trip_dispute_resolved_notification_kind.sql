@@ -1,0 +1,13 @@
+-- Notification kind for a resolved trip dispute.
+--
+-- `resolveTripDispute` writes a `TRIP_DISPUTE_RESOLVED` notice to both
+-- participants when a reviewer records whether the trip happened, but the value
+-- was never added to the `notification_kind` enum. Because the notice is written
+-- in the same transaction as the decision, the missing enum value made the whole
+-- reviewer resolution fail at runtime — the request stayed `DISPUTED` and the
+-- caller saw an internal error. Adding the enum value makes the write valid.
+--
+-- The matching kind also has to be present in the code-writing checks: see
+-- `scripts/health-check.mjs`, which now derives the kinds it expects from the
+-- server source instead of a hand-maintained list.
+ALTER TYPE notification_kind ADD VALUE IF NOT EXISTS 'TRIP_DISPUTE_RESOLVED';

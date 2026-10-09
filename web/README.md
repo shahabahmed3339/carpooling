@@ -30,7 +30,7 @@ For hosted/non-local environments, configure a verified email sender with `RESEN
 
 ## Database
 
-Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community; 0024 requires both confirmations for a completed request. Do not run migrations against a shared/production database unless that is the intended operation.
+Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community; 0024 requires both confirmations for a completed request; 0025 adds the `TRIP_DISPUTE_RESOLVED` notification kind that the reviewer resolution writes. Do not run migrations against a shared/production database unless that is the intended operation.
 
 If a migration file is edited after it was applied, the runner refuses to continue (it would silently apply a different schema than the database holds). After verifying the live schema by hand, reconcile only that file with `node ./scripts/migrate.mjs --rebaseline-checksum=<filename>`; it records the new checksum and does not re-run any SQL. Use it deliberately, and prefer a new migration whenever the change is not purely documentary.
 
@@ -49,8 +49,8 @@ Two checks assert behaviour against live data rather than page text:
 ```bash
 node scripts/verify-completion.mjs       # schema invariants; exits non-zero if any fail
 node scripts/verify-no-show.mjs          # expiry evidence path, end to end (self-cleaning)
-node scripts/verify-dispute.mjs          # dispute raise/resolve guards, end to end (self-cleaning)
-node scripts/verify-account-closure.mjs  # closure refusal, seat release, PII erase (self-cleaning)
+npm run verify:dispute                   # calls the REAL resolveTripDispute/listOpenTripDisputes (self-cleaning)
+node scripts/verify-account-closure.mjs  # calls the REAL deleteOwnAccount (self-cleaning)
 node scripts/verify-notifications.mjs    # event-key dedup, pagination, read state (self-cleaning)
 node scripts/verify-concurrency.mjs      # parallel accepts, double-accept, accept-vs-cancel (self-cleaning)
 node scripts/verify-contribution.mjs     # cost-sharing note copy-on-publish rules (self-cleaning)
@@ -59,6 +59,15 @@ node scripts/verify-reviewer-role.mjs    # reviewer-role grant/refuse paths (sel
 node scripts/verify-area-alias.mjs       # area-alias resolution and matching (self-cleaning)
 node scripts/verify-support.mjs          # support-contact read/write and operator gate (self-cleaning)
 ```
+
+`verify:dispute` and `verify:account-closure` import the real server services
+rather than re-implementing their SQL, using `scripts/lib/alias-loader.mjs`
+(which maps the `@/*` TypeScript path alias) via `node
+--experimental-transform-types --import ./scripts/lib/register.mjs`. Prefer this
+approach for new checks: a script that copies the query it is testing verifies
+the copy, and will keep passing after the real code changes — which is how a
+broken dispute-resolution path stayed green, and how the closure mirror had
+already drifted from the service it claimed to check.
 
 `npm run db:audit-retention` reports aged data volumes read-only, so a retention window can be chosen from real numbers.
 

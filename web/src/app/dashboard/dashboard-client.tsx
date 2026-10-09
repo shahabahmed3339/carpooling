@@ -224,6 +224,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   const [myReports, setMyReports] = useState<SafetyReport[]>([]);
   const [support, setSupport] = useState<{ contact: string | null; hours: string | null }>({ contact: null, hours: null });
   const [notifications, setNotifications] = useState<InboxNotification[]>([]);
+  const [notificationsLoaded, setNotificationsLoaded] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const [notificationHasMore, setNotificationHasMore] = useState(false);
   const [loadingOlderNotifications, setLoadingOlderNotifications] = useState(false);
@@ -246,6 +247,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [sessionChanging, setSessionChanging] = useState(false);
+  const [dashboardLoaded, setDashboardLoaded] = useState(false);
 
   const roleRef = useRef(role);
   const loadSeqRef = useRef(0);
@@ -307,6 +309,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       });
       setUnreadCount(result.unreadCount);
       if (!loadedOlderNotificationsRef.current) setNotificationHasMore(result.hasMore);
+      setNotificationsLoaded(true);
     } catch {
       // Inbox polling is best-effort; leave the last successful inbox visible.
     }
@@ -364,9 +367,13 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       setMyReports(reportResult.reports);
       setSupport(supportResult.support);
       setError("");
+      setDashboardLoaded(true);
     } catch (cause) {
       if (seq !== loadSeqRef.current) return;
       setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
+      // Mark the dashboard as settled so the empty-state text is honest rather
+      // than a stand-in for data that never arrived.
+      setDashboardLoaded(true);
     }
   }, [accountApi]);
 
@@ -665,6 +672,14 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
     setSelectedDays((current) => current.includes(day) ? current.filter((value) => value !== day) : [...current, day].sort());
   }
 
+  // While the first dashboard load is still in flight, an account's existing
+  // trips/requests/reports are not rendered yet. Saying "No requests yet" at
+  // that moment reads as if the data is gone, so show a loading placeholder
+  // until the first load settles.
+  function emptyState(message: string) {
+    return <p className={styles.muted}>{dashboardLoaded ? message : "Loading…"}</p>;
+  }
+
   if (sessionChanging) {
     return <main className={styles.page} aria-live="polite"><p>Updating your session…</p></main>;
   }
@@ -688,7 +703,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       <section className={styles.panel} aria-label="Notification inbox">
         <div className={styles.item}><h2>Notifications{unreadCount > 0 ? ` · ${unreadCount} unread` : ""}</h2>{unreadCount > 0 && <button className={styles.secondary} onClick={() => void markNotificationRead()} disabled={busy}>Mark all read</button>}</div>
         <p className={styles.muted}>Updates refresh automatically while this page is open.</p>
-        {notifications.length === 0 ? <p className={styles.muted}>No notifications yet.</p> : notifications.map((notification) => <div className={styles.item} key={notification.id}>
+        {notifications.length === 0 ? <p className={styles.muted}>{notificationsLoaded ? "No notifications yet." : "Loading…"}</p> : notifications.map((notification) => <div className={styles.item} key={notification.id}>
           <div><strong>{notification.title}{notification.readAt ? "" : " · New"}</strong><p>{notification.body} · {new Date(notification.createdAt).toLocaleString()}</p>{notification.kind === "SAFETY_REPORT_RECEIVED" && <a href="/moderation/reports">Open safety review queue</a>}{notification.kind === "TRIP_DISPUTE_REVIEW_REQUESTED" && <a href="/moderation/reports">Open safety review queue</a>}{notification.kind === "SAFETY_REPORT_STATUS_UPDATED" && <button className={styles.secondary} onClick={() => void viewReportStatus(notification.resourceId, notification.id)}>View my report status</button>}{notification.resourceType !== "SAFETY_REPORT" && notification.kind !== "TRIP_DISPUTE_REVIEW_REQUESTED" && <button className={styles.secondary} disabled={busy} onClick={() => void openNotificationTarget(notification)}>View on dashboard</button>}</div>
           {!notification.readAt && <button className={styles.secondary} onClick={() => void markNotificationRead(notification.id)}>Mark read</button>}
         </div>)}
@@ -698,7 +713,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       <section className={styles.panel} id="activity">
         <h2>Your activity</h2>
         <p className={styles.muted}>Trips and requests from both Rider and Driver modes.</p>
-        {activity.length === 0 ? <p className={styles.muted}>No trips or requests yet.</p> : activity.map((item) => (
+        {activity.length === 0 ? emptyState("No trips or requests yet.") : activity.map((item) => (
           <div className={styles.item} key={`${item.kind}-${item.recordId}`}>
             <div>
               <strong>{item.kind === "TRIP" ? "You offered a ride" : item.role === "DRIVER" ? "A rider requested a seat" : "You requested a ride"}: {item.originArea} → {item.destinationArea}</strong>
@@ -721,7 +736,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
 
       <section className={styles.panel} id="my-reports">
         <h2>Your reports</h2>
-        {myReports.length === 0 ? <p className={styles.muted}>No reports submitted.</p> : myReports.map((report) => <div className={styles.item} key={report.reportId}><div><strong>{report.reportedName} · {report.reason.replaceAll("_", " ").toLowerCase()}</strong><p>{new Date(report.createdAt).toLocaleString()} · {report.status.replaceAll("_", " ").toLowerCase()}</p></div></div>)}
+        {myReports.length === 0 ? emptyState("No reports submitted.") : myReports.map((report) => <div className={styles.item} key={report.reportId}><div><strong>{report.reportedName} · {report.reason.replaceAll("_", " ").toLowerCase()}</strong><p>{new Date(report.createdAt).toLocaleString()} · {report.status.replaceAll("_", " ").toLowerCase()}</p></div></div>)}
         <div className={styles.item}>
           <div>
             <strong>Need help from a person?</strong>
@@ -736,7 +751,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
 
       <section className={styles.panel}>
         <h2>Blocked users</h2>
-        {blockedUsers.length === 0 ? <p className={styles.muted}>You haven’t blocked anyone.</p> : blockedUsers.map((user) => (
+        {blockedUsers.length === 0 ? emptyState("You haven’t blocked anyone.") : blockedUsers.map((user) => (
           <div className={styles.item} key={user.userId}>
             <strong>{user.displayName}</strong>
             <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(user.userId, user.displayName, false)}>Unblock</button>
@@ -784,7 +799,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           <section className={styles.panel}>
             <h2>Publish a dated trip</h2>
             <p className={styles.muted}>Your usual travel days only limit which dates are available. They do not publish trips automatically; publish each date you are offering a seat.</p>
-            {commutes.length === 0 ? <p className={styles.muted}>Save a commute first. You can then publish a particular future date.</p> : commutes.map((commute) => (
+            {commutes.length === 0 ? emptyState("Save a commute first. You can then publish a particular future date.") : commutes.map((commute) => (
               <div className={styles.item} key={commute.id}>
                 <div><strong>{commute.originArea} → {commute.destinationArea}</strong><p>{commute.departureWindowStart} · {commute.seatsOffered} seat(s) · Usually: {commute.weekdays.map((day) => weekdays[day]).join(", ")}{commute.contributionNote ? ` · Cost sharing: ${commute.contributionNote}` : ""}</p></div>
                 <div className={styles.inline}>
@@ -798,7 +813,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           </section>
           <section className={styles.panel} id="published-trips">
             <h2>Your published trips</h2>
-            {publishedTrips.length === 0 ? <p className={styles.muted}>No upcoming trips published yet.</p> : publishedTrips.map((trip) => (
+            {publishedTrips.length === 0 ? emptyState("No upcoming trips published yet.") : publishedTrips.map((trip) => (
               <div className={styles.item} key={trip.tripOccurrenceId}>
                 <div><strong>{trip.originArea} → {trip.destinationArea}</strong><p>{trip.tripDate} at {trip.departureTime} · {trip.status.toLowerCase()} · {trip.seatsReserved}/{trip.seatCapacity} seats requested{trip.contributionNote ? ` · Cost sharing: ${trip.contributionNote}` : ""}</p></div>
                 {trip.canCancel && <button className={styles.danger} disabled={busy} onClick={() => void cancelTrip(trip)}>Cancel trip</button>}
@@ -807,7 +822,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           </section>
           <section className={styles.panel}>
             <h2>Seat requests</h2>
-            <RequestList requests={requests} role={role} busy={busy} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
+            <RequestList requests={requests} role={role} busy={busy} loaded={dashboardLoaded} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
           </section>
         </>
       ) : (
@@ -837,7 +852,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           </section>
           <section className={styles.panel}>
             <h2>Your requests</h2>
-            <RequestList requests={requests} role={role} busy={busy} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
+            <RequestList requests={requests} role={role} busy={busy} loaded={dashboardLoaded} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
           </section>
         </>
       )}
@@ -846,15 +861,16 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   );
 }
 
-function RequestList({ requests, role, busy, onAction, onConfirm, onDispute }: {
+function RequestList({ requests, role, busy, loaded, onAction, onConfirm, onDispute }: {
   requests: RideRequest[];
   role: ParticipantRole;
   busy: boolean;
+  loaded: boolean;
   onAction: (requestId: string, action: "accept" | "reject" | "cancel") => Promise<void>;
   onConfirm: (requestId: string) => Promise<void>;
   onDispute: (requestId: string) => Promise<void>;
 }) {
-  if (requests.length === 0) return <p className={styles.muted}>No requests yet.</p>;
+  if (requests.length === 0) return <p className={styles.muted}>{loaded ? "No requests yet." : "Loading…"}</p>;
   return <div className={styles.list}>{requests.map((request) => {
     const myConfirmation = role === "DRIVER"
       ? request.driverConfirmedCompletion

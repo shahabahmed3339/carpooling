@@ -49,20 +49,33 @@ const fail = (name, detail) => blocking.push({ name, detail });
 const warn = (name, detail) => warnings.push({ name, detail });
 const pass = (name, detail) => ok.push({ name, detail });
 
-const EXPECTED_KINDS = [
-  "RIDE_REQUESTED",
-  "RIDE_ACCEPTED",
-  "RIDE_REJECTED",
-  "RIDE_CANCELLED",
-  "TRIP_CANCELLED",
-  "COMPLETION_CONFIRMED",
-  "TRIP_COMPLETED",
-  "TRIP_DISPUTED",
-  "COMPLETION_EXPIRED",
-  "SAFETY_REPORT_RECEIVED",
-  "SAFETY_REPORT_STATUS_UPDATED",
-  "TRIP_DISPUTE_REVIEW_REQUESTED",
-];
+// Notification kinds are derived from the server source, not a hand-maintained
+// list: a hardcoded list can only catch a kind someone remembered to add, which
+// is exactly how a written-but-unmigrated kind (`TRIP_DISPUTE_RESOLVED`) reached
+// runtime and made reviewer dispute resolution fail. Scanning the source means a
+// new `kind: "..."` is checked the moment it is written.
+async function notificationKindsWrittenBySource() {
+  const kinds = new Set();
+  async function scan(dir) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = `${dir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await scan(path);
+      } else if (entry.isFile() && /\.[cm]?[jt]sx?$/.test(entry.name)) {
+        const source = await readFile(path, "utf8");
+        // A notification literal is `kind: "X"` immediately followed by
+        // `eventKey:`. Requiring the pair skips same-named unions such as
+        // `AccountActivityItem.kind: "TRIP" | "REQUEST"`, which is not a
+        // notification kind and would otherwise be reported as a false miss.
+        for (const match of source.matchAll(/kind:\s*"([A-Z_]+)"\s*,\s*eventKey:/g)) {
+          kinds.add(match[1]);
+        }
+      }
+    }
+  }
+  await scan("src");
+  return [...kinds].sort();
+}
 
 /** Tables and columns the running app requires; a missing one is fatal. */
 const REQUIRED = [
@@ -156,12 +169,13 @@ try {
       WHERE t.typname = 'notification_kind' ORDER BY e.enumsortorder`,
   );
   const present = new Set(result.rows.map((r) => r.enumlabel));
-  const missingKinds = EXPECTED_KINDS.filter((k) => !present.has(k));
+  const expectedKinds = await notificationKindsWrittenBySource();
+  const missingKinds = expectedKinds.filter((k) => !present.has(k));
   if (missingKinds.length > 0) {
     // A missing kind means a state change would throw at runtime.
-    fail("notification kinds present", `missing: ${missingKinds.join(", ")}`);
+    fail("notification kinds present", `written by code but absent from the enum: ${missingKinds.join(", ")}`);
   } else {
-    pass("notification kinds present", `${present.size} kind(s)`);
+    pass("notification kinds present", `${expectedKinds.length} kind(s) written by code are all in the enum`);
   }
 } catch (error) {
   fail("notification kind check", error.message);

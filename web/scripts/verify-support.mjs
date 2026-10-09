@@ -66,13 +66,18 @@ async function canWrite(userId) {
   return result.rowCount === 1;
 }
 
-// Use a real member account to test the authorization boundary.
-const accounts = await pool.query(
-  `SELECT u.id, m.role FROM users u JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
-    WHERE u.status='ACTIVE' AND m.status='ACTIVE' LIMIT 4`,
+// Use a real MEMBER account to test the authorization boundary. Do not fall
+// back to an arbitrary account: if none is a plain member, the assertion below
+// would run against an OPERATOR and fail while appearing to prove the gate
+// works. Select a member explicitly, and fail loudly if the database has none.
+const memberResult = await pool.query(
+  `SELECT u.id, m.role FROM users u
+     JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
+    WHERE u.status='ACTIVE' AND m.status='ACTIVE' AND m.role = 'MEMBER' LIMIT 1`,
   [CID],
 );
-const member = accounts.rows.find((r) => r.role === "MEMBER") ?? { id: accounts.rows[0].id, role: "MEMBER" };
+const member = memberResult.rows[0];
+if (!member) throw new Error("need at least one plain MEMBER account to test the operator gate");
 
 const original = await readSupport();
 try {

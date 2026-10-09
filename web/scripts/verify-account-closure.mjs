@@ -35,118 +35,72 @@ const CID = "00000000-0000-4000-8000-000000000002";
 const results = [];
 const check = (name, pass, detail) => results.push({ name, pass, detail });
 
-async function createAccount(client, label) {
+/**
+ * The real closure service, imported from the server source. The previous
+ * version mirrored its SQL by hand, and the mirror had already drifted: it did
+ * not delete the Better Auth identity row, write the withdrawal notices, or
+ * create the account_deletion_requests row the real service does. A mirror
+ * cannot stay honest about code it duplicates.
+ */
+const { deleteOwnAccount } = await import("@/server/users/account");
+
+function actorFor(userId, email) {
+  return { userId, email, communityId: CID, participantRole: "RIDER" };
+}
+
+async function createAccount(label) {
   const id = randomUUID();
-  await client.query(
+  const authId = randomUUID();
+  const email = `acctest-${id}@verify.local`;
+  await pool.query(
+    `INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+     VALUES ($1, $2, $3, true, now(), now())`,
+    [authId, label, email],
+  );
+  await pool.query(
     `INSERT INTO users (id, auth_subject, display_name, participant_role)
      VALUES ($1, $2, $3, 'RIDER')`,
-    [id, `acctest-subject-${id}`, label],
+    [id, authId, label],
   );
-  await client.query(
+  await pool.query(
     `INSERT INTO community_memberships (community_id, user_id, status, role, reviewed_by, reviewed_at)
      VALUES ($1, $2, 'ACTIVE', 'MEMBER', $2, now())`,
     [CID, id],
   );
-  return id;
+  return { id, authId, email };
 }
 
 /**
- * Mirror of withdrawOpenCommitments + the erase step in src/server/users/account.ts.
- * Kept as SQL only; the invariant checker guards against drift.
+ * Close an account through the real service.
+ *
+ * Returns `{ refused }` so the existing assertions keep their shape: the service
+ * signals refusal by throwing a RideDomainError rather than returning a flag.
+ * The caller must have released/committed the fixture first — the service opens
+ * its own transaction on the shared pool and will not see uncommitted rows.
  */
-async function closeAccount(client, userId) {
-  const trips = await client.query(
-    `SELECT o.id,
-            EXISTS (SELECT 1 FROM ride_requests r
-                     WHERE r.trip_occurrence_id = o.id AND r.community_id = o.community_id
-                       AND r.rider_user_id = $2 AND r.status IN ('REQUESTED','ACCEPTED')) AS has_rider_request,
-            (o.driver_user_id = $2 AND o.status = 'OPEN' AND o.departure_at > clock_timestamp()) AS has_future_driver_trip
-       FROM trip_occurrences o
-      WHERE o.community_id = $1
-        AND (EXISTS (SELECT 1 FROM ride_requests r
-                      WHERE r.trip_occurrence_id = o.id AND r.community_id = o.community_id
-                        AND r.rider_user_id = $2 AND r.status IN ('REQUESTED','ACCEPTED'))
-             OR (o.driver_user_id = $2 AND o.status = 'OPEN' AND o.departure_at > clock_timestamp()))
-      ORDER BY o.id FOR UPDATE OF o`,
-    [CID, userId],
-  );
-  const riderTripIds = trips.rows.filter((r) => r.has_rider_request).map((r) => r.id);
-  const driverTripIds = trips.rows.filter((r) => r.has_future_driver_trip).map((r) => r.id);
-
-  const inProgress = await client.query(
-    `SELECT 1 FROM ride_requests r
-       JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
-      WHERE r.community_id = $1 AND (r.rider_user_id = $2 OR o.driver_user_id = $2)
-        AND r.status IN ('REQUESTED','ACCEPTED') AND o.status = 'OPEN'
-        AND o.departure_at <= clock_timestamp() LIMIT 1`,
-    [CID, userId],
-  );
-  if (inProgress.rowCount) return { refused: true };
-
-  const acceptedCounts = riderTripIds.length === 0 ? [] : (await client.query(
-    `SELECT r.trip_occurrence_id, count(*)::integer AS accepted_count
-       FROM ride_requests r
-       JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
-      WHERE r.community_id = $1 AND r.rider_user_id = $2 AND r.trip_occurrence_id = ANY($3::uuid[])
-        AND r.status = 'ACCEPTED' AND o.status = 'OPEN'
-      GROUP BY r.trip_occurrence_id`,
-    [CID, userId, riderTripIds],
-  )).rows;
-
-  await client.query(
-    `UPDATE ride_requests r SET status = 'CANCELLED', updated_at = now()
-       FROM trip_occurrences o
-      WHERE r.community_id = $1 AND r.rider_user_id = $2
-        AND r.trip_occurrence_id = o.id AND r.community_id = o.community_id
-        AND r.status IN ('REQUESTED','ACCEPTED')`,
-    [CID, userId],
-  );
-  for (const a of acceptedCounts) {
-    await client.query(
-      `UPDATE trip_occurrences SET seats_reserved = seats_reserved - $2, updated_at = now()
-        WHERE id = $1 AND community_id = $3 AND status = 'OPEN' AND seats_reserved >= $2`,
-      [a.trip_occurrence_id, a.accepted_count, CID],
-    );
+async function closeAccount(account) {
+  try {
+    await deleteOwnAccount({ actor: actorFor(account.id, account.email) });
+    return { refused: false };
+  } catch (error) {
+    if (typeof error.code === "string" && error.status && error.status < 500) {
+      return { refused: true, reason: error.code };
+    }
+    throw error;
   }
-  if (driverTripIds.length > 0) {
-    await client.query(
-      `UPDATE ride_requests r SET status = 'CANCELLED', updated_at = now()
-        WHERE r.community_id = $1 AND r.trip_occurrence_id = ANY($2::uuid[])
-          AND r.status IN ('REQUESTED','ACCEPTED')`,
-      [CID, driverTripIds],
-    );
-    await client.query(
-      `UPDATE trip_occurrences SET status = 'CANCELLED', seats_reserved = 0, updated_at = now()
-        WHERE community_id = $1 AND id = ANY($2::uuid[]) AND status = 'OPEN'`,
-      [CID, driverTripIds],
-    );
-  }
-
-  await client.query(
-    `UPDATE users SET status='DEACTIVATED', display_name='Closed account',
-            auth_subject = 'deleted:' || id::text, updated_at = now()
-      WHERE id = $1`,
-    [userId],
-  );
-  await client.query(
-    `UPDATE community_memberships SET status='REJECTED', updated_at=now()
-      WHERE community_id = $1 AND user_id = $2`,
-    [CID, userId],
-  );
-  return { refused: false };
 }
 
-async function makeTrip(client, driverId, { departed, seats = 1 }) {
+async function makeTrip(driverId, { departed, seats = 1 }) {
   const commuteId = randomUUID();
   const tripId = randomUUID();
-  await client.query(
+  await pool.query(
     `INSERT INTO commute_templates
        (id, community_id, owner_user_id, origin_area, destination_area,
         departure_window_start, departure_window_end, role, seats_offered)
      VALUES ($1,$2,$3,'acGulberg','acDHA','08:00','08:20','OFFERING',$4)`,
     [commuteId, CID, driverId, seats],
   );
-  await client.query(
+  await pool.query(
     `INSERT INTO trip_occurrences
        (id, commute_template_id, community_id, driver_user_id, trip_date, departure_at,
         timezone, origin_area, destination_area, seat_capacity, seats_reserved, status)
@@ -159,61 +113,92 @@ async function makeTrip(client, driverId, { departed, seats = 1 }) {
   return { commuteId, tripId };
 }
 
+/**
+ * Remove fixtures left by an earlier interrupted run (marker: `acGulberg`), so a
+ * crashed run cannot collide with the next one's inserts.
+ */
+async function removeOrphanedFixtures() {
+  await pool.query(
+    `DELETE FROM ride_requests r USING trip_occurrences o, commute_templates t
+      WHERE r.trip_occurrence_id = o.id AND o.commute_template_id = t.id
+        AND t.origin_area = 'acGulberg'`,
+  ).catch(() => {});
+  await pool.query(
+    `DELETE FROM trip_occurrences o USING commute_templates t
+      WHERE o.commute_template_id = t.id AND t.origin_area = 'acGulberg'`,
+  ).catch(() => {});
+  await pool.query("DELETE FROM commute_templates WHERE origin_area = 'acGulberg'").catch(() => {});
+  await pool.query("DELETE FROM in_app_notifications WHERE actor_user_id IN (SELECT id FROM users WHERE display_name LIKE 'ac%')").catch(() => {});
+  await pool.query("DELETE FROM account_deletion_requests WHERE user_id IN (SELECT id FROM users WHERE display_name LIKE 'ac%')").catch(() => {});
+  await pool.query("DELETE FROM community_memberships WHERE user_id IN (SELECT id FROM users WHERE display_name LIKE 'ac%')").catch(() => {});
+  await pool.query("DELETE FROM users WHERE display_name LIKE 'ac%'").catch(() => {});
+  await pool.query('DELETE FROM "user" WHERE email LIKE \'acctest-%@verify.local\'').catch(() => {});
+}
+
+await removeOrphanedFixtures();
+
 const created = { users: [], commutes: [], trips: [], requests: [] };
-const client = await pool.connect();
+// Fixtures and assertions all run through `pool` (each query is its own
+// autocommit transaction). The real closure service opens its own transaction on
+// the same pool, so nothing may be held open across a `closeAccount` call —
+// holding a fixture transaction here would deadlock on the rows it locks.
 try {
   // --- Case 1: closure refused while a trip already departed ---------------
   {
-    const driverId = await createAccount(client, "acDriver1");
-    const riderId = await createAccount(client, "acRider1");
-    created.users.push(driverId, riderId);
-    const { commuteId, tripId } = await makeTrip(client, driverId, { departed: true });
+    const driver = await createAccount("acDriver1");
+    const rider = await createAccount("acRider1");
+    const driverId = driver.id;
+    const riderId = rider.id;
+    created.users.push(driver, rider);
+    const { commuteId, tripId } = await makeTrip(driverId, { departed: true });
     created.commutes.push(commuteId);
     created.trips.push(tripId);
     const requestId = randomUUID();
     created.requests.push(requestId);
-    await client.query(
+    await pool.query(
       `INSERT INTO ride_requests (id, trip_occurrence_id, community_id, rider_user_id, status, accepted_at)
        VALUES ($1,$2,$3,$4,'ACCEPTED', now() - interval '3 hours')`,
       [requestId, tripId, CID, riderId],
     );
 
-    const outcome = await closeAccount(client, riderId);
+    const outcome = await closeAccount(rider);
     check("closure refused while on a departed trip", outcome.refused === true, JSON.stringify(outcome));
-    const still = await client.query("SELECT status FROM users WHERE id=$1", [riderId]);
+    const still = await pool.query("SELECT status FROM users WHERE id=$1", [riderId]);
     check("refused closure leaves the account active", still.rows[0]?.status === "ACTIVE", JSON.stringify(still.rows));
   }
 
   // --- Case 2: rider closure releases an accepted seat (undeparted trip) ---
   {
-    const driverId = await createAccount(client, "acDriver2");
-    const riderId = await createAccount(client, "acRider2");
-    created.users.push(driverId, riderId);
-    const { commuteId, tripId } = await makeTrip(client, driverId, { departed: false });
+    const driver = await createAccount("acDriver2");
+    const rider = await createAccount("acRider2");
+    const driverId = driver.id;
+    const riderId = rider.id;
+    created.users.push(driver, rider);
+    const { commuteId, tripId } = await makeTrip(driverId, { departed: false });
     created.commutes.push(commuteId);
     created.trips.push(tripId);
     const requestId = randomUUID();
     created.requests.push(requestId);
-    await client.query(
+    await pool.query(
       `INSERT INTO ride_requests (id, trip_occurrence_id, community_id, rider_user_id, status, accepted_at)
        VALUES ($1,$2,$3,$4,'ACCEPTED', now())`,
       [requestId, tripId, CID, riderId],
     );
 
-    const outcome = await closeAccount(client, riderId);
+    const outcome = await closeAccount(rider);
     check("rider closure succeeds", outcome.refused === false, JSON.stringify(outcome));
 
-    const seat = await client.query("SELECT seats_reserved, status FROM trip_occurrences WHERE id=$1", [tripId]);
+    const seat = await pool.query("SELECT seats_reserved, status FROM trip_occurrences WHERE id=$1", [tripId]);
     check(
       "accepted seat released and trip still open",
       seat.rows[0]?.seats_reserved === 0 && seat.rows[0]?.status === "OPEN",
       JSON.stringify(seat.rows[0]),
     );
 
-    const req = await client.query("SELECT status FROM ride_requests WHERE id=$1", [requestId]);
+    const req = await pool.query("SELECT status FROM ride_requests WHERE id=$1", [requestId]);
     check("rider request withdrawn to CANCELLED", req.rows[0]?.status === "CANCELLED", JSON.stringify(req.rows[0]));
 
-    const user = await client.query("SELECT status, display_name, auth_subject FROM users WHERE id=$1", [riderId]);
+    const user = await pool.query("SELECT status, display_name, auth_subject FROM users WHERE id=$1", [riderId]);
     check(
       "identity erased (DEACTIVATED, no name, no auth subject)",
       user.rows[0]?.status === "DEACTIVATED" &&
@@ -222,74 +207,79 @@ try {
       JSON.stringify(user.rows[0]),
     );
 
-    const member = await client.query(
+    const member = await pool.query(
       "SELECT status FROM community_memberships WHERE community_id=$1 AND user_id=$2",
       [CID, riderId],
     );
     check("membership is no longer ACTIVE", member.rows[0]?.status !== "ACTIVE", JSON.stringify(member.rows[0]));
 
-    const history = await client.query("SELECT status FROM ride_requests WHERE id=$1", [requestId]);
+    const history = await pool.query("SELECT status FROM ride_requests WHERE id=$1", [requestId]);
     check("historical request row survives for other participants", history.rowCount === 1, JSON.stringify(history.rows));
   }
 
   // --- Case 3: driver closure cancels a future trip and its requests -------
   {
-    const driverId = await createAccount(client, "acDriver3");
-    const riderId = await createAccount(client, "acRider3");
-    created.users.push(driverId, riderId);
-    const { commuteId, tripId } = await makeTrip(client, driverId, { departed: false });
+    const driver = await createAccount("acDriver3");
+    const rider = await createAccount("acRider3");
+    const driverId = driver.id;
+    const riderId = rider.id;
+    created.users.push(driver, rider);
+    const { commuteId, tripId } = await makeTrip(driverId, { departed: false });
     created.commutes.push(commuteId);
     created.trips.push(tripId);
     const requestId = randomUUID();
     created.requests.push(requestId);
-    await client.query(
+    await pool.query(
       `INSERT INTO ride_requests (id, trip_occurrence_id, community_id, rider_user_id, status, accepted_at)
        VALUES ($1,$2,$3,$4,'ACCEPTED', now())`,
       [requestId, tripId, CID, riderId],
     );
 
-    const outcome = await closeAccount(client, driverId);
+    const outcome = await closeAccount(driver);
     check("driver closure succeeds", outcome.refused === false, JSON.stringify(outcome));
 
-    const trip = await client.query("SELECT status, seats_reserved FROM trip_occurrences WHERE id=$1", [tripId]);
+    const trip = await pool.query("SELECT status, seats_reserved FROM trip_occurrences WHERE id=$1", [tripId]);
     check(
       "driver's future trip cancelled with capacity settled",
       trip.rows[0]?.status === "CANCELLED" && trip.rows[0]?.seats_reserved === 0,
       JSON.stringify(trip.rows[0]),
     );
-    const req = await client.query("SELECT status FROM ride_requests WHERE id=$1", [requestId]);
+    const req = await pool.query("SELECT status FROM ride_requests WHERE id=$1", [requestId]);
     check("rider's request on the cancelled trip withdrawn", req.rows[0]?.status === "CANCELLED", JSON.stringify(req.rows[0]));
   }
 } finally {
   // Delete in strict FK order. Each step is awaited so a failure cannot silently
   // leave fixtures behind; the first error is reported rather than swallowed.
   for (const id of created.requests) {
-    await client.query("DELETE FROM ride_requests WHERE id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM ride_requests WHERE id=$1", [id]).catch(() => {});
   }
   for (const id of created.trips) {
-    await client.query("DELETE FROM trip_occurrences WHERE id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM trip_occurrences WHERE id=$1", [id]).catch(() => {});
   }
   for (const id of created.commutes) {
-    await client.query("DELETE FROM commute_templates WHERE id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM commute_templates WHERE id=$1", [id]).catch(() => {});
   }
-  for (const id of created.users) {
-    await client.query("DELETE FROM account_deletion_requests WHERE user_id=$1", [id]).catch(() => {});
-    await client.query("DELETE FROM user_blocks WHERE blocker_user_id=$1 OR blocked_user_id=$1", [id]).catch(() => {});
-    await client.query("DELETE FROM community_memberships WHERE user_id=$1", [id]).catch(() => {});
-    await client.query("DELETE FROM users WHERE id=$1", [id]).catch(() => {});
+  for (const account of created.users) {
+    const id = account.id;
+    await pool.query("DELETE FROM in_app_notifications WHERE recipient_user_id=$1 OR actor_user_id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM account_deletion_requests WHERE user_id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM user_blocks WHERE blocker_user_id=$1 OR blocked_user_id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM community_memberships WHERE user_id=$1", [id]).catch(() => {});
+    await pool.query("DELETE FROM users WHERE id=$1", [id]).catch(() => {});
+    await pool.query('DELETE FROM "user" WHERE id=$1', [account.authId]).catch(() => {});
   }
   // Report any residue so a broken cleanup is visible instead of leaking rows.
-  const residue = await client.query(
+  const residue = await pool.query(
     `SELECT
-       (SELECT count(*)::int FROM users WHERE auth_subject LIKE 'acctest-%') AS users,
+       (SELECT count(*)::int FROM users WHERE display_name LIKE 'ac%') AS users,
+       (SELECT count(*)::int FROM "user" WHERE email LIKE 'acctest-%') AS auth_users,
        (SELECT count(*)::int FROM commute_templates WHERE origin_area = 'acGulberg') AS commutes,
        (SELECT count(*)::int FROM trip_occurrences WHERE origin_area = 'acGulberg') AS trips`,
   );
   const left = residue.rows[0];
-  if (left.users || left.commutes || left.trips) {
+  if (left.users || left.auth_users || left.commutes || left.trips) {
     console.log(`WARNING: fixture cleanup left ${JSON.stringify(left)}`);
   }
-  client.release();
 }
 
 let failed = 0;
