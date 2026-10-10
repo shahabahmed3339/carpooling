@@ -76,6 +76,25 @@ the closure mirror drifted from the service it claimed to check, and how a real
 
 `npm run db:maintenance` runs all three cleanup commands (notifications, idempotency, history) in one invocation so an environment schedules a single job, and accepts `--dry-run` to preview every step. It exits non-zero if any step failed. The app schedules none of this itself — configure a periodic job in each environment.
 
+## Dashboard structure
+
+The dashboard is a shell plus one route per job, not one long page.
+
+| Route | Purpose |
+|---|---|
+| `/dashboard` | Overview: counts, and only what needs your attention |
+| `/dashboard/trips` | Driver: the weekly commute and published dates |
+| `/dashboard/search` | Rider: find a published trip |
+| `/dashboard/requests` | Seat requests from both sides of the seat |
+| `/dashboard/activity` | The full feed, both modes, read-only |
+| `/dashboard/ratings` | Ratings received, and the aggregate |
+| `/dashboard/safety` | Reports, blocked users, support contact |
+| `/dashboard/settings` | Profile, vehicle, account closure |
+
+- **`src/app/dashboard/layout.tsx`** does the session check and renders the shell, so a page cannot be added without the check. It also provides `DashboardProvider`, which holds the account-level state shared by every page: mode, the notification inbox and its 30-second poll, and the profile. One inbox means the header bell and the pages cannot disagree about the unread count.
+- **`src/components/dashboard/app-shell.tsx`** is the sidebar (role-aware — a rider never sees *My commute & trips* and a driver never sees *Find a ride*) and the header (mode switch, notification bell with unread badge and popover, account menu).
+- **`src/components/dashboard/api-client.ts`** is every authenticated request. It keeps the `X-Carpool-Actor` and `X-Carpool-Mode` response checks and the stable `Idempotency-Key`, so a page that uses it gets the cross-tab and retry safety for free. **Do not fetch directly from a page** — that would skip those guards.
+
 ## Route-corridor matching (the map/pin model)
 
 The product requirement: a driver going **Muridke → Model Town Lahore** should match a rider going **Rana Town → MAO College**, because the rider's leg lies along the driver's route — regardless of how far apart the names are and with no fixed radius. `ROUTE_MATCHING_PLAN.md` has the design; `src/domain/geo.ts` has the logic.

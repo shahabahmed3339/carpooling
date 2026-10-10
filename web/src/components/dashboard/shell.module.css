@@ -1,0 +1,319 @@
+/* Dashboard shell: fixed sidebar, sticky header, scrollable content.
+   Written with plain CSS custom properties (no framework) to match the existing
+   hand-written CSS in this app. */
+
+.shell {
+  --sidebar-width: 250px;
+  --header-height: 56px;
+  --ink: #17202a;
+  --muted: #5b6672;
+  --line: #d9dee4;
+  --surface: #ffffff;
+  --canvas: #f4f6f8;
+  --accent: #0f6b4f;
+  --danger: #b3261e;
+
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  min-height: 100vh;
+  background: var(--canvas);
+  color: var(--ink);
+}
+
+/* --- Sidebar ------------------------------------------------------------- */
+
+.sidebar {
+  background: #10241f;
+  color: #e7efe9;
+  padding: 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.brandMark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.8rem;
+}
+
+.brandText { font-size: 0.95rem; }
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.navLink {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  color: #cfdad4;
+  text-decoration: none;
+  border-left: 3px solid transparent;
+}
+
+.navLink:hover { background: rgba(255, 255, 255, 0.07); color: #fff; }
+
+/* The active item is marked by colour, a left border and weight — not colour
+   alone, so it survives a colour-blind viewer and a monochrome screenshot. */
+.navLinkActive {
+  background: rgba(255, 255, 255, 0.11);
+  border-left-color: #48b48a;
+  color: #fff;
+  font-weight: 600;
+}
+
+.navLabel { font-size: 0.92rem; }
+.navHint { font-size: 0.72rem; color: #93a89e; line-height: 1.25; }
+.navLinkActive .navHint { color: #b9cdc3; }
+
+/* --- Main column --------------------------------------------------------- */
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+
+.header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  height: var(--header-height);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 18px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.navToggle {
+  display: none;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 9px;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.headerRight { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+
+.modeSwitch {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--canvas);
+}
+
+.modeSwitch button {
+  border: 0;
+  background: transparent;
+  padding: 6px 16px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.modeSwitch button[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.modeSwitch button:disabled { opacity: 0.6; cursor: default; }
+
+/* --- Notification bell --------------------------------------------------- */
+
+.bellWrap { position: relative; }
+
+.bell {
+  position: relative;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  width: 38px;
+  height: 38px;
+  font-size: 1rem;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.bell:hover { background: var(--canvas); }
+
+.badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: min(380px, calc(100vw - 32px));
+  max-height: 70vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: 0 12px 34px rgba(16, 36, 31, 0.18);
+}
+
+.popoverHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.popoverBody { overflow-y: auto; padding: 4px 0; }
+
+.popoverEmpty { padding: 16px 14px; color: var(--muted); margin: 0; }
+
+.notification {
+  padding: 10px 14px;
+  border-bottom: 1px solid #eef1f3;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.notification p { margin: 3px 0 0; font-size: 0.85rem; color: var(--muted); }
+.notificationTime { font-size: 0.74rem !important; }
+.notificationActions { display: flex; gap: 12px; align-items: center; font-size: 0.82rem; }
+.notificationActions a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.notificationActions a:hover { text-decoration: underline; }
+
+.moreButton {
+  display: block;
+  width: calc(100% - 28px);
+  margin: 10px 14px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--canvas);
+  cursor: pointer;
+}
+
+.linkButton {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.linkButton:hover { text-decoration: underline; }
+
+/* --- Account menu -------------------------------------------------------- */
+
+.accountMenu { position: relative; }
+
+.accountMenu summary {
+  cursor: pointer;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.85rem;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  list-style: none;
+}
+
+.accountMenu summary::-webkit-details-marker { display: none; }
+.accountMenu[open] summary { background: var(--canvas); }
+
+.accountBody {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  min-width: 230px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 12px 34px rgba(16, 36, 31, 0.18);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.accountEmail { margin: 0; font-size: 0.82rem; color: var(--muted); word-break: break-all; }
+.accountLink { color: var(--accent); text-decoration: none; font-size: 0.86rem; font-weight: 600; }
+.accountLink:hover { text-decoration: underline; }
+
+/* --- Banners and content ------------------------------------------------- */
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 14px 18px 0;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 0.9rem;
+}
+
+.bannerNotice { background: #e8f5ef; border: 1px solid #b7ddcb; color: #124d3a; }
+.bannerError { background: #fdecea; border: 1px solid #f2c3bd; color: #7a1c15; }
+
+.content { padding: 18px; max-width: 1100px; width: 100%; }
+
+/* --- Narrow screens ------------------------------------------------------
+   The sidebar becomes an off-canvas drawer toggled from the header. Without this
+   the two-column grid squeezes the content to an unreadable width on a phone,
+   which is how this app is mostly used. */
+
+@media (max-width: 860px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+
+  .sidebar {
+    position: fixed;
+    z-index: 40;
+    width: var(--sidebar-width);
+    transform: translateX(-100%);
+    transition: transform 0.18s ease-out;
+  }
+
+  .shell[data-nav-open="true"] .sidebar { transform: translateX(0); }
+
+  .navToggle { display: inline-block; }
+
+  .accountMenu summary { max-width: 120px; }
+}

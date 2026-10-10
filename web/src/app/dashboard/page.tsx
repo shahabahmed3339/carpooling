@@ -1,19 +1,12 @@
-import { Suspense } from "react";
-import { redirect } from "next/navigation";
-import { getPilotAccessState } from "@/server/auth/actor";
-import DashboardClient from "./dashboard-client";
+import OverviewClient from "./overview-client";
 
+/**
+ * The overview page.
+ *
+ * The access check and the shell (sidebar, header, notification bell) are in
+ * `layout.tsx`, so they apply to every page under `/dashboard` and cannot be
+ * forgotten when a page is added. This component renders only its own content.
+ */
 export default function DashboardPage() {
-  return <Suspense fallback={<main><p>Loading your commute dashboard…</p></main>}><DashboardContent /></Suspense>;
-}
-
-async function DashboardContent() {
-  const access = await getPilotAccessState();
-  if (access.status === "AUTH_DISABLED" || access.status === "SIGNED_OUT") redirect("/login");
-  if (access.status !== "ACTIVE") redirect("/auth/complete");
-  return <DashboardClient
-    initialMode={access.actor.participantRole}
-    accountEmail={access.actor.email}
-    accountId={access.actor.userId}
-  />;
+  return <OverviewClient />;
 }
