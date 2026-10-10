@@ -53,6 +53,36 @@ type RideRequest = {
   tripStatus: "OPEN" | "CANCELLED" | "COMPLETED";
   riderConfirmedCompletion: boolean;
   driverConfirmedCompletion: boolean;
+  driverMeetingDetail: string | null;
+  riderMeetingDetail: string | null;
+};
+type MyProfile = {
+  displayName: string;
+  phone: string | null;
+  phoneVerified: boolean;
+  vehicle: {
+    id: string;
+    make: string;
+    model: string;
+    colour: string;
+    plate: string;
+    seatCapacity: number;
+  } | null;
+};
+type CounterpartIdentity = {
+  displayName: string;
+  phone: string | null;
+  phoneVerified: boolean;
+  vehicle: { id: string; make: string; model: string; colour: string; plate: string; seatCapacity: number } | null;
+  rating: { average: number | null; count: number; hasEnoughForAverage: boolean };
+};
+type ReceivedRating = {
+  ratingId: string;
+  score: number;
+  comment: string | null;
+  createdAt: string;
+  authorName: string;
+  requestId: string;
 };
 type DriverTrip = {
   tripOccurrenceId: string;
@@ -250,6 +280,26 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   const [busy, setBusy] = useState(false);
   const [sessionChanging, setSessionChanging] = useState(false);
   const [dashboardLoaded, setDashboardLoaded] = useState(false);
+  const [profile, setProfile] = useState<MyProfile | null>(null);
+  // Counterpart identity per accepted request. Kept out of the main load so a
+  // failure here cannot blank the dashboard, and so only accepted requests cost
+  // a fetch.
+  const [identities, setIdentities] = useState<Record<string, CounterpartIdentity>>({});
+  const identitySeqRef = useRef(0);
+  const [receivedRatings, setReceivedRatings] = useState<ReceivedRating[]>([]);
+  // Requests this account has already rated, so the form is not offered twice (the
+  // server would refuse the second attempt, but showing a form that cannot be sent
+  // is a worse experience than showing "thanks").
+  const [ratedRequestIds, setRatedRequestIds] = useState<Set<string>>(new Set());
+  const [profileDraft, setProfileDraft] = useState({
+    displayName: "",
+    phone: "",
+    make: "",
+    model: "",
+    colour: "",
+    plate: "",
+    seatCapacity: 4,
+  });
 
   const roleRef = useRef(role);
   const loadSeqRef = useRef(0);
@@ -347,6 +397,81 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   // Single guarded loader. A monotonic sequence number ensures a slow, earlier
   // response can never overwrite data from a newer one (for example a reload
   // triggered by "publish" racing the reload for a mode switch).
+  /** Ratings written about this account, newest first. Best-effort. */
+  const loadReceivedRatings = useCallback(async () => {
+    try {
+      const result = await accountApi<{ ratings: ReceivedRating[]; authoredRequestIds: string[] }>("/api/ratings");
+      setReceivedRatings(result.ratings);
+      // Which requests *this* account has rated. Distinct from the ratings it has
+      // received — conflating the two re-offered the form on a trip already rated.
+      setRatedRequestIds(new Set(result.authoredRequestIds));
+    } catch {
+      // The dashboard remains usable without the ratings panel.
+    }
+  }, [accountApi]);
+
+  /**
+   * Rate the other participant on a completed trip.
+   *
+   * A rating cannot be edited or withdrawn once sent (the database refuses both),
+   * so the prompt says so rather than letting someone discover it after the fact.
+   */
+  async function rateCounterpart(requestId: string, name: string) {
+    const entered = window.prompt(
+      `Rate ${name} from 1 to 5. Add a short comment after a space, e.g. "5 Punctual and careful". A rating cannot be changed or withdrawn once sent — use a safety report if something went wrong.`,
+      "5 ",
+    );
+    if (entered === null) return;
+    // Parse "<score> <rest>" without the `s` dotAll flag, which this build target
+    // does not support; the comment is split out by string slicing instead.
+    const trimmed = entered.trim();
+    const firstToken = trimmed.slice(0, 1);
+    if (!/^[1-5]$/.test(firstToken)) {
+      setError("Enter a score from 1 to 5, optionally followed by a comment.");
+      return;
+    }
+    const score = Number(firstToken);
+    const comment = trimmed.slice(1).trim();
+    await perform(async () => {
+      await apiIdempotent(`/api/rides/${requestId}/rating`, {
+        method: "POST",
+        body: JSON.stringify({ score, comment: comment.length === 0 ? null : comment }),
+      });
+      setRatedRequestIds((current) => new Set(current).add(requestId));
+      await loadReceivedRatings();
+    }, `Thanks — your rating of ${name} was recorded.`);
+  }
+
+  /**
+   * Load who the other participant is, for each accepted request only.
+   *
+   * Declared before `loadDashboard` because that callback calls it, and defined as
+   * a ref-guarded function so a slow earlier response cannot overwrite a newer one
+   * after a mode switch or a re-publish.
+   *
+   * The server returns `identity: null` for anything not accepted or not the
+   * caller's, so a stale request id yields nothing rather than an error. Failures
+   * are swallowed per request: one missing identity must not hide the others.
+   */
+  const loadIdentities = useCallback(async (requests: RideRequest[]) => {
+    const seq = ++identitySeqRef.current;
+    const accepted = requests.filter((request) => request.status === "ACCEPTED");
+    const entries = await Promise.all(
+      accepted.map(async (request) => {
+        try {
+          const result = await accountApi<{ identity: CounterpartIdentity | null }>(
+            `/api/rides/${request.requestId}/counterpart`,
+          );
+          return [request.requestId, result.identity] as const;
+        } catch {
+          return [request.requestId, null] as const;
+        }
+      }),
+    );
+    if (seq !== identitySeqRef.current) return;
+    setIdentities(Object.fromEntries(entries.filter(([, identity]) => identity !== null)) as Record<string, CounterpartIdentity>);
+  }, [accountApi]);
+
   const loadDashboard = useCallback(async () => {
     const seq = ++loadSeqRef.current;
     const activeRole = roleRef.current;
@@ -370,6 +495,9 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       setSupport(supportResult.support);
       setError("");
       setDashboardLoaded(true);
+      // Identity is fetched only for accepted requests, so it runs after the main
+      // load rather than inside it.
+      void loadIdentities(requestResult.requests);
     } catch (cause) {
       if (seq !== loadSeqRef.current) return;
       setError(cause instanceof Error ? cause.message : "Could not load your dashboard.");
@@ -377,7 +505,38 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
       // than a stand-in for data that never arrived.
       setDashboardLoaded(true);
     }
+  }, [accountApi, loadIdentities]);
+
+  // The profile is separate from the dashboard data: it is the account's own
+  // identity, not ride state, and a failure to load it must not blank the
+  // dashboard. It is loaded once rather than on every mode change.
+  const loadProfile = useCallback(async () => {
+    try {
+      const result = await accountApi<MyProfile>("/api/profile");
+      setProfile(result);
+      setProfileDraft({
+        displayName: result.displayName,
+        phone: result.phone ?? "",
+        make: result.vehicle?.make ?? "",
+        model: result.vehicle?.model ?? "",
+        colour: result.vehicle?.colour ?? "",
+        plate: result.vehicle?.plate ?? "",
+        seatCapacity: result.vehicle?.seatCapacity ?? 4,
+      });
+    } catch {
+      // Best-effort: the dashboard remains usable without the profile panel.
+    }
   }, [accountApi]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadProfile(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadProfile]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadReceivedRatings(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadReceivedRatings]);
 
   useEffect(() => {
     roleRef.current = role;
@@ -522,6 +681,62 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
     }, "Seat request sent to the driver.");
   }
 
+  /**
+   * Save the caller's own identity. A vehicle is only sent when the driver has
+   * filled it in; sending it from an empty form would clear a saved car by
+   * accident, so an all-blank vehicle block means "leave it alone".
+   */
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const hasVehicle = [profileDraft.make, profileDraft.model, profileDraft.colour, profileDraft.plate]
+        .some((value) => value.trim().length > 0);
+      await accountApi("/api/profile", {
+        method: "PATCH",
+        body: JSON.stringify({
+          displayName: profileDraft.displayName.trim(),
+          phone: profileDraft.phone.trim().length === 0 ? null : profileDraft.phone.trim(),
+          ...(hasVehicle
+            ? {
+                vehicle: {
+                  make: profileDraft.make.trim(),
+                  model: profileDraft.model.trim(),
+                  colour: profileDraft.colour.trim(),
+                  plate: profileDraft.plate.trim(),
+                  seatCapacity: profileDraft.seatCapacity,
+                },
+              }
+            : {}),
+        }),
+      });
+      await loadProfile();
+      setNotice("Profile saved. Your phone and vehicle are shown only to a rider whose seat you have accepted.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save your profile.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Remove the saved vehicle, so the driver stops showing a car. */
+  async function removeVehicle() {
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      await accountApi("/api/profile", { method: "PATCH", body: JSON.stringify({ vehicle: null }) });
+      await loadProfile();
+      setNotice("Vehicle removed.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not remove the vehicle.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function requestAction(requestId: string, action: "accept" | "reject" | "cancel") {
     await perform(async () => {
       await apiIdempotent(`/api/rides/${requestId}/${action}`, {
@@ -536,6 +751,27 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
         method: "POST",
       });
     }, "Thanks — your confirmation was recorded.");
+  }
+
+  /**
+   * Share (or withdraw) the precise meeting detail for an accepted trip.
+   *
+   * Only offered while the seat is confirmed — the server refuses it at any other
+   * status, so this is a convenience, not the guard. An empty entry clears it,
+   * which is how someone takes back something they no longer want to share.
+   */
+  async function editMeetingDetail(requestId: string, current: string | null) {
+    const entered = window.prompt(
+      "Share an exact pickup point or contact detail for this confirmed ride. Leaving it blank withdraws what you shared. Only the other participant sees this, and only while the seat is confirmed.",
+      current ?? "",
+    );
+    if (entered === null) return; // cancelled the prompt: change nothing
+    await perform(async () => {
+      await apiIdempotent(`/api/rides/${requestId}/meeting-detail`, {
+        method: "PUT",
+        body: JSON.stringify({ detail: entered.trim().length === 0 ? null : entered.trim() }),
+      });
+    }, entered.trim().length === 0 ? "Your meeting detail was withdrawn." : "Your meeting detail was shared with the other participant.");
   }
 
   async function disputeCompletion(requestId: string) {
@@ -736,6 +972,24 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
         </form>}
       </section>
 
+      <section className={styles.panel}>
+        <h2>Ratings about you</h2>
+        <p className={styles.muted}>
+          Written by the other participant after a completed trip. Ratings cannot be changed or withdrawn once
+          sent, and nothing here is used to suspend an account automatically — a pattern is a matter for a human
+          reviewer.
+        </p>
+        {receivedRatings.length === 0 ? <p className={styles.muted}>No ratings yet.</p> : receivedRatings.map((rating) => (
+          <div className={styles.item} key={rating.ratingId}>
+            <div>
+              <strong>{rating.score} / 5 · {rating.authorName}</strong>
+              {rating.comment ? <p>{rating.comment}</p> : <p className={styles.muted}>No comment.</p>}
+              <p>{new Date(rating.createdAt).toLocaleString()}</p>
+            </div>
+          </div>
+        ))}
+      </section>
+
       <section className={styles.panel} id="my-reports">
         <h2>Your reports</h2>
         {myReports.length === 0 ? emptyState("No reports submitted.") : myReports.map((report) => <div className={styles.item} key={report.reportId}><div><strong>{report.reportedName} · {report.reason.replaceAll("_", " ").toLowerCase()}</strong><p>{new Date(report.createdAt).toLocaleString()} · {report.status.replaceAll("_", " ").toLowerCase()}</p></div></div>)}
@@ -759,6 +1013,39 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
             <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(user.userId, user.displayName, false)}>Unblock</button>
           </div>
         ))}
+      </section>
+
+      <section className={styles.panel}>
+        <h2>Your profile</h2>
+        <p className={styles.muted}>
+          Riders need to recognise who is coming and which car to look for. Your phone and vehicle are
+          shown to the other participant <strong>only once a seat is confirmed</strong>, never while a request
+          is pending or after it is cancelled. Your display name is shown on trips you publish and search.
+        </p>
+        <form className={styles.form} onSubmit={saveProfile}>
+          <label>Display name<input maxLength={80} value={profileDraft.displayName} onChange={(event) => setProfileDraft((current) => ({ ...current, displayName: event.target.value }))} placeholder="e.g. Ali R." /></label>
+          <label>
+            Phone {profile?.phoneVerified ? "(verified)" : "(not verified)"}
+            <input inputMode="tel" maxLength={20} value={profileDraft.phone} onChange={(event) => setProfileDraft((current) => ({ ...current, phone: event.target.value }))} placeholder="e.g. 0300 1234567" />
+          </label>
+          <p className={styles.muted}>
+            Stored as you type it, digits only. Verification by text message is not available yet, so the number is marked unverified.
+          </p>
+          {role === "DRIVER" && (
+            <>
+              <p className={styles.muted}>Your vehicle, so a rider can find the right car:</p>
+              <label>Make<input maxLength={60} value={profileDraft.make} onChange={(event) => setProfileDraft((current) => ({ ...current, make: event.target.value }))} placeholder="e.g. Toyota" /></label>
+              <label>Model<input maxLength={60} value={profileDraft.model} onChange={(event) => setProfileDraft((current) => ({ ...current, model: event.target.value }))} placeholder="e.g. Corolla" /></label>
+              <label>Colour<input maxLength={30} value={profileDraft.colour} onChange={(event) => setProfileDraft((current) => ({ ...current, colour: event.target.value }))} placeholder="e.g. White" /></label>
+              <label>Plate<input maxLength={20} value={profileDraft.plate} onChange={(event) => setProfileDraft((current) => ({ ...current, plate: event.target.value }))} placeholder="e.g. LE A-1234" /></label>
+              <label>Seats a rider can take<input min={1} max={8} type="number" value={profileDraft.seatCapacity} onChange={(event) => setProfileDraft((current) => ({ ...current, seatCapacity: Number(event.target.value) }))} /></label>
+            </>
+          )}
+          <div className={styles.inline}>
+            <button disabled={busy || profileDraft.displayName.trim().length === 0}>Save profile</button>
+            {profile?.vehicle && <button className={styles.secondary} disabled={busy} type="button" onClick={() => void removeVehicle()}>Remove vehicle</button>}
+          </div>
+        </form>
       </section>
 
       <section className={styles.panel}>
@@ -824,7 +1111,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           </section>
           <section className={styles.panel}>
             <h2>Seat requests</h2>
-            <RequestList requests={requests} role={role} busy={busy} loaded={dashboardLoaded} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
+            <RequestList requests={requests} role={role} busy={busy} loaded={dashboardLoaded} identities={identities} ratedRequestIds={ratedRequestIds} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} onMeetingDetail={editMeetingDetail} onRate={rateCounterpart} />
           </section>
         </>
       ) : (
@@ -856,7 +1143,7 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
           </section>
           <section className={styles.panel}>
             <h2>Your requests</h2>
-            <RequestList requests={requests} role={role} busy={busy} loaded={dashboardLoaded} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} />
+            <RequestList requests={requests} role={role} busy={busy} loaded={dashboardLoaded} identities={identities} ratedRequestIds={ratedRequestIds} onAction={requestAction} onConfirm={confirmCompletion} onDispute={disputeCompletion} onMeetingDetail={editMeetingDetail} onRate={rateCounterpart} />
           </section>
         </>
       )}
@@ -865,20 +1152,29 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
   );
 }
 
-function RequestList({ requests, role, busy, loaded, onAction, onConfirm, onDispute }: {
+function RequestList({ requests, role, busy, loaded, identities, ratedRequestIds, onAction, onConfirm, onDispute, onMeetingDetail, onRate }: {
   requests: RideRequest[];
   role: ParticipantRole;
   busy: boolean;
   loaded: boolean;
+  identities: Record<string, CounterpartIdentity>;
+  ratedRequestIds: Set<string>;
   onAction: (requestId: string, action: "accept" | "reject" | "cancel") => Promise<void>;
   onConfirm: (requestId: string) => Promise<void>;
   onDispute: (requestId: string) => Promise<void>;
+  onMeetingDetail: (requestId: string, current: string | null) => Promise<void>;
+  onRate: (requestId: string, name: string) => Promise<void>;
 }) {
   if (requests.length === 0) return <p className={styles.muted}>{loaded ? "No requests yet." : "Loading…"}</p>;
   return <div className={styles.list}>{requests.map((request) => {
     const myConfirmation = role === "DRIVER"
       ? request.driverConfirmedCompletion
       : request.riderConfirmedCompletion;
+    // The driver reads the rider's detail and vice versa. Each side edits only its
+    // own, and the server blanks both unless the seat is confirmed.
+    const theirDetail = role === "DRIVER" ? request.riderMeetingDetail : request.driverMeetingDetail;
+    const myDetail = role === "DRIVER" ? request.driverMeetingDetail : request.riderMeetingDetail;
+    const identity = identities[request.requestId];
     return (
       <div className={styles.item} key={request.requestId}>
         <div>
@@ -893,6 +1189,58 @@ function RequestList({ requests, role, busy, loaded, onAction, onConfirm, onDisp
               ? "You confirmed this trip. Waiting for the other participant."
               : "This trip has departed. Confirm it happened, or report a problem."}</p>}
           {request.status === "REQUESTED" && request.departurePassed && <p className={styles.inlineMessage}>This trip departed before the seat was accepted. The request can no longer be actioned and will be closed.</p>}
+          {/*
+            Meeting details appear only on a confirmed seat. The precise pickup
+            point and any contact information are what two people need to actually
+            meet; showing them on a pending request would leak one party's details
+            to someone the other has not agreed to travel with.
+          */}
+          {/* Who is coming, and which car. Fetched separately and only for accepted
+              requests, because a pending request must reveal neither. */}
+          {request.status === "ACCEPTED" && identity && (
+            <div className={styles.inlineMessage}>
+              {identity.phone
+                ? <p><strong>{request.otherParticipantName}&apos;s phone:</strong> {identity.phone}{identity.phoneVerified ? " (verified)" : " (unverified)"}</p>
+                : <p>{request.otherParticipantName} has not added a phone number.</p>}
+              {identity.vehicle
+                ? <p><strong>Vehicle:</strong> {identity.vehicle.colour} {identity.vehicle.make} {identity.vehicle.model} · {identity.vehicle.plate}</p>
+                : null}
+              {/* An average is withheld until enough ratings exist, so a name is
+                  never shown with a score earned from one opinion. */}
+              <p>
+                <strong>Rating:</strong>{" "}
+                {identity.rating.average !== null
+                  ? `${identity.rating.average} / 5 from ${identity.rating.count} rating${identity.rating.count === 1 ? "" : "s"}`
+                  : identity.rating.count > 0
+                    ? `${identity.rating.count} rating${identity.rating.count === 1 ? "" : "s"} so far — no score shown until there are more`
+                    : "no ratings yet"}
+              </p>
+            </div>
+          )}
+          {/* Rate the other side once the trip is done. Offered only on a
+              completed request, since a ride that did not happen is not rateable. */}
+          {request.status === "COMPLETED" && !ratedRequestIds.has(request.requestId) && (
+            <div className={styles.inline}>
+              <button disabled={busy} onClick={() => void onRate(request.requestId, request.otherParticipantName)}>Rate {request.otherParticipantName}</button>
+            </div>
+          )}
+          {request.status === "COMPLETED" && ratedRequestIds.has(request.requestId) && (
+            <p className={styles.inlineMessage}>You rated this trip.</p>
+          )}
+          {request.status === "ACCEPTED" && (
+            <div className={styles.inlineMessage}>
+              {theirDetail
+                ? <p><strong>{request.otherParticipantName}&apos;s meeting detail:</strong> {theirDetail}</p>
+                : <p>{request.otherParticipantName} has not shared a meeting detail yet.</p>}
+              <p>
+                {myDetail ? <>You shared: {myDetail}. </> : null}
+                <button className={styles.secondary} disabled={busy} onClick={() => void onMeetingDetail(request.requestId, myDetail)}>
+                  {myDetail ? "Change or withdraw your detail" : "Share an exact pickup point or contact"}
+                </button>
+              </p>
+              <p>Only the two of you can see this, and it is removed automatically if the seat stops being confirmed.</p>
+            </div>
+          )}
         </div>
         {request.status === "REQUESTED" && role === "DRIVER" && !request.departurePassed && <div className={styles.inline}><button disabled={busy} onClick={() => void onAction(request.requestId, "accept")}>Accept</button><button className={styles.secondary} disabled={busy} onClick={() => void onAction(request.requestId, "reject")}>Decline</button></div>}
         {request.awaitingCompletion && request.status === "ACCEPTED" && <div className={styles.inline}>

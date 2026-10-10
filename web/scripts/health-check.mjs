@@ -84,7 +84,10 @@ const REQUIRED = [
   ["community_memberships", ["community_id", "user_id", "status", "role"]],
   ["commute_templates", ["id", "community_id", "owner_user_id", "origin_area", "destination_area", "contribution_note"]],
   ["trip_occurrences", ["id", "status", "seat_capacity", "seats_reserved", "contribution_note"]],
-  ["ride_requests", ["id", "status", "rider_confirmed_completion", "driver_confirmed_completion"]],
+  ["ride_requests", ["id", "status", "rider_confirmed_completion", "driver_confirmed_completion", "driver_meeting_detail", "rider_meeting_detail"]],
+  ["driver_vehicles", ["id", "user_id", "make", "model", "colour", "plate", "seat_capacity"]],
+  ["trip_ratings", ["id", "community_id", "ride_request_id", "author_user_id", "subject_user_id", "score"]],
+  ["commute_routes", ["commute_template_id", "points", "point_count", "distance_meters", "provider"]],
   ["trip_disputes", ["id", "resolved_at", "resolution"]],
   ["safety_reports", ["id", "status", "assigned_to", "resolution_notes"]],
   ["safety_report_events", ["id", "report_id", "to_status"]],
@@ -279,6 +282,37 @@ try {
       "no area coordinate is stored un-normalized",
       `SELECT id FROM area_coordinates
         WHERE area <> lower(regexp_replace(btrim(area), '[[:space:]]+', ' ', 'g')) LIMIT 1`,
+    ],
+    [
+      // A rating must describe a ride that actually completed. A rating on any
+      // other status would score someone for a trip that did not happen.
+      "no rating exists on a request that is not COMPLETED",
+      `SELECT t.id FROM trip_ratings t
+         JOIN ride_requests r ON r.id = t.ride_request_id
+        WHERE r.status <> 'COMPLETED' LIMIT 1`,
+    ],
+    [
+      "no rating is authored by its own subject",
+      `SELECT id FROM trip_ratings WHERE author_user_id = subject_user_id LIMIT 1`,
+    ],
+    [
+      // The read path joins `users` for the author's name, so a rating whose
+      // author or subject is a deactivated account would attach a name to a
+      // tombstone that is supposed to carry none. Closure erases them (0031).
+      "no rating references a closed account",
+      `SELECT t.id FROM trip_ratings t
+         JOIN users u ON u.id = t.author_user_id OR u.id = t.subject_user_id
+        WHERE u.status <> 'ACTIVE' LIMIT 1`,
+    ],
+    [
+      // A precise meeting detail must never survive on a request that is not an
+      // accepted seat, or a declined or cancelled counterparty could still read a
+      // phone number. The schema trigger clears these, so any row here means the
+      // trigger is missing or was bypassed.
+      "no meeting detail is retained on a non-accepted request",
+      `SELECT id FROM ride_requests
+        WHERE status <> 'ACCEPTED'
+          AND (driver_meeting_detail IS NOT NULL OR rider_meeting_detail IS NOT NULL) LIMIT 1`,
     ],
     [
       "no duplicate coordinate for one area in a community",

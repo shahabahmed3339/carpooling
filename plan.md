@@ -36,13 +36,15 @@ There is no user-facing community, invitation, sponsor, or operator signup step.
 
 Keep the first release to authentication, mode switching, commute templates, dated trip publishing/search, seat requests, driver accept/decline, rider cancellation, mutual completion confirmation, dispute capture, blocking/reporting, and the in-app notification inbox. Defer payments, live tracking, route optimization, ratings, identity document uploads, organization dashboards, and native apps until there is a concrete need.
 
+> **Superseded in part, 2026-10:** the owner asked for an app in the class of Uber/Careem/InDrive/Yango. That reverses the deferral above for ratings (now Phase 1), and plans payments, live tracking, geospatial dispatch and native apps in later phases. See **`RIDE_HAILING_ROADMAP.md`** for the phased plan and the decisions that gate each phase. This file still describes the **shipped carpooling scope**; the roadmap describes the **intended hailing scope**. The carpooling flow is kept, not replaced.
+
 ## Release steps
 
 1. Apply all database migrations, including the shared marketplace migration, to the intended development database.
 2. Configure auth secret, base URL, email sender/provider, and `AUTH_ENABLED=true`; test local email links through the development terminal only on localhost.
 3. Create two test accounts. Verify Rider-to-Driver and Driver-to-Rider switching, then exercise a dated trip from the two accounts.
 4. Verify the same user can keep their own driver trips and rider requests after switching. Confirm authorization is enforced server-side, not just by hiding UI.
-5. Verify ride and safety-report notifications across two browser sessions, including reviewer and reporter inbox delivery, read state, and major ride transitions. Verify the reviewer-only report history, the open-dispute queue and both resolution outcomes, and queue refresh. The configured database has migrations `0001` through `0025` applied.
+5. Verify ride and safety-report notifications across two browser sessions, including reviewer and reporter inbox delivery, read state, and major ride transitions. Verify the reviewer-only report history, the open-dispute queue and both resolution outcomes, and queue refresh. The configured database has migrations `0001` through `0028` applied.
 6. Resolve operational policies before production or real rides: a staffed report queue and escalation path, support contact, cancellation/no-show rules, data retention/deletion, and an incident response owner. In-app notices do not page staff or provide emergency response.
 
 ## Decision rule

@@ -228,16 +228,26 @@ export async function createTripOccurrence(input: {
         }
 
         const created = await client.query<{ id: string; status: OccurrenceResult["status"] }>(
+          // The route geometry is snapshotted from the commute at publish time, for
+          // the same reason the cost-sharing note is: a commute stays editable, and
+          // an already-published trip must not silently acquire a new path. Riders
+          // matched the route they were shown. A commute with no route yet yields
+          // NULLs, and the trip simply falls back to area matching.
           `INSERT INTO trip_occurrences (
              id, commute_template_id, community_id, driver_user_id, trip_date,
              departure_at, timezone, origin_area, destination_area,
-             seat_capacity, seats_reserved, contribution_note
+             seat_capacity, seats_reserved, contribution_note,
+             origin_lat, origin_lng, destination_lat, destination_lng,
+             route_points, route_distance_meters, route_duration_seconds
            )
            SELECT $1, t.id, t.community_id, t.owner_user_id, $3::date,
                   ($3::date + t.departure_window_start) AT TIME ZONE t.timezone,
                   t.timezone, t.origin_area, t.destination_area,
-                  t.seats_offered, 0, t.contribution_note
+                  t.seats_offered, 0, t.contribution_note,
+                  t.origin_lat, t.origin_lng, t.destination_lat, t.destination_lng,
+                  cr.points, cr.distance_meters, cr.duration_seconds
              FROM commute_templates t
+             LEFT JOIN commute_routes cr ON cr.commute_template_id = t.id
              JOIN communities c ON c.id = t.community_id AND c.status = 'ACTIVE'
              JOIN community_memberships m
                ON m.community_id = t.community_id
@@ -768,6 +778,15 @@ export type RideRequestSummary = {
   tripStatus: "OPEN" | "CANCELLED" | "COMPLETED";
   riderConfirmedCompletion: boolean;
   driverConfirmedCompletion: boolean;
+  /**
+   * The precise meeting detail each side supplied, shared only while a seat is
+   * granted. Null when the other side has not written one, and always null unless
+   * `status` is `ACCEPTED` — the query masks it rather than relying on the UI to
+   * hide it, so a declined or cancelled request never carries a phone number to
+   * the opposite participant.
+   */
+  driverMeetingDetail: string | null;
+  riderMeetingDetail: string | null;
 };
 
 export type DriverTripSummary = {
@@ -927,7 +946,13 @@ export async function listRideRequests(actor: AuthenticatedActor): Promise<RideR
               ) AS "disputeResolved",
               o.status AS "tripStatus",
               r.rider_confirmed_completion AS "riderConfirmedCompletion",
-              r.driver_confirmed_completion AS "driverConfirmedCompletion"
+              r.driver_confirmed_completion AS "driverConfirmedCompletion",
+              -- Masked to NULL unless the seat is actually granted. The columns
+              -- are additionally cleared by trigger when a request leaves
+              -- ACCEPTED, so this CASE is the read-side half of the same rule:
+              -- it holds even for a row written before that trigger existed.
+              CASE WHEN r.status = 'ACCEPTED' THEN r.driver_meeting_detail END AS "driverMeetingDetail",
+              CASE WHEN r.status = 'ACCEPTED' THEN r.rider_meeting_detail END AS "riderMeetingDetail"
          FROM ride_requests r
          JOIN trip_occurrences o ON o.id = r.trip_occurrence_id AND o.community_id = r.community_id
          CROSS JOIN trip_policy p
@@ -944,4 +969,111 @@ export async function listRideRequests(actor: AuthenticatedActor): Promise<RideR
     );
     return result.rows;
   });
+}
+
+/**
+ * Set (or clear) the caller's own precise meeting detail for an accepted trip.
+ *
+ * Each participant writes only their own column, so neither can rewrite the
+ * other's text. The detail is a free-text landmark or contact detail the two
+ * people need to actually meet — an exact pickup point, a phone number — and it
+ * is deliberately available only while the seat is granted: a pending request
+ * reveals nothing, and anything written is cleared the moment the request stops
+ * being accepted (by trigger), so a declined or cancelled counterparty cannot
+ * retain a phone number.
+ *
+ * `detail` of null (or blank) clears the field, which is how someone withdraws
+ * information they no longer want shared.
+ */
+export async function setMeetingDetail(input: {
+  actor: AuthenticatedActor;
+  requestId: string;
+  detail: string | null;
+  idempotencyKey: string;
+}): Promise<IdempotentResult<{ requestId: string; detail: string | null }>> {
+  const raw = input.detail === null ? null : input.detail.trim();
+  const normalized = raw === null || raw.length === 0 ? null : raw;
+  if (normalized !== null && normalized.length > 500) {
+    throw invalid("MEETING_DETAIL_TOO_LONG", "Keep the meeting detail to 500 characters or fewer.");
+  }
+
+  return inTransaction(async (client) =>
+    withIdempotency<{ requestId: string; detail: string | null }>({
+      client,
+      actorUserId: input.actor.userId,
+      operation: "ride-request.meeting-detail",
+      key: input.idempotencyKey,
+      requestFingerprint: JSON.stringify({
+        communityId: input.actor.communityId,
+        requestId: input.requestId,
+        detail: normalized,
+      }),
+      work: async () => {
+        await lockUserActions(client, [input.actor.userId]);
+        await assertActiveCommunityMember(client, input.actor.communityId, input.actor.userId);
+
+        // Lock the trip before the request, the same global order accept/cancel
+        // use, so this cannot deadlock against them.
+        const lookup = await client.query<{ trip_occurrence_id: string; rider_user_id: string; status: string }>(
+          `SELECT r.trip_occurrence_id, r.rider_user_id, r.status
+             FROM ride_requests r
+            WHERE r.id = $1 AND r.community_id = $2`,
+          [input.requestId, input.actor.communityId],
+        );
+        const found = lookup.rows[0];
+        if (!found) throw notFound();
+
+        const tripResult = await client.query<{ driver_user_id: string }>(
+          `SELECT driver_user_id FROM trip_occurrences
+            WHERE id = $1 AND community_id = $2 FOR UPDATE`,
+          [found.trip_occurrence_id, input.actor.communityId],
+        );
+        const driverUserId = tripResult.rows[0]?.driver_user_id;
+        if (!driverUserId) throw notFound();
+
+        // Participant check comes before the status check so a non-participant
+        // cannot probe a request's state by the error they get back.
+        const isRider = found.rider_user_id === input.actor.userId;
+        const isDriver = driverUserId === input.actor.userId;
+        if (!isRider && !isDriver) throw forbidden();
+
+        const requestResult = await client.query<{ status: string }>(
+          "SELECT status FROM ride_requests WHERE id = $1 FOR UPDATE",
+          [input.requestId],
+        );
+        if (requestResult.rows[0]?.status !== "ACCEPTED") {
+          throw conflict(
+            "REQUEST_NOT_ACCEPTED",
+            "A meeting detail can be shared only while the seat is confirmed.",
+          );
+        }
+
+        const column = isDriver ? "driver_meeting_detail" : "rider_meeting_detail";
+        await client.query(
+          `UPDATE ride_requests SET ${column} = $2, updated_at = now() WHERE id = $1`,
+          [input.requestId, normalized],
+        );
+
+        // Tell the other participant a detail is now available — but not the
+        // detail itself. An inbox row is retained and polled broadly; putting a
+        // phone number in it would widen who can read it beyond the ride.
+        const recipientUserId = isDriver ? found.rider_user_id : driverUserId;
+        await addNotification(client, {
+          communityId: input.actor.communityId,
+          recipientUserId,
+          actorUserId: input.actor.userId,
+          kind: "MEETING_DETAIL_SHARED",
+          eventKey: `meeting-detail:${input.requestId}:${isDriver ? "driver" : "rider"}:${normalized === null ? "cleared" : "set"}`,
+          title: normalized === null ? "Meeting detail withdrawn" : "Meeting detail shared",
+          body: normalized === null
+            ? "The other participant removed their meeting detail."
+            : "The other participant added a meeting detail for your confirmed ride. Open your dashboard to see it.",
+          resourceType: "RIDE_REQUEST",
+          resourceId: input.requestId,
+        });
+
+        return { status: 200, body: { requestId: input.requestId, detail: normalized } };
+      },
+    }),
+  );
 }

@@ -75,6 +75,22 @@ export async function deleteOwnAccount(input: {
       [input.actor.communityId, input.actor.userId],
     );
 
+    // Erase the ratings this account wrote or received.
+    //
+    // A rating is personal data pointing at a person: the read path joins
+    // `users` to show the author's name, so a rating left behind after closure
+    // would keep a name attached to a tombstone that is supposed to have no
+    // identity. Ratings are otherwise immutable (a user cannot withdraw one), so
+    // the erasure is signalled explicitly with a session flag that 0031's trigger
+    // honours — the alternative, a blanket delete allowance, is what let a user
+    // retract a rating in the first place.
+    await client.query("SET LOCAL app.allow_rating_erasure = 'on'");
+    await client.query(
+      `DELETE FROM trip_ratings
+        WHERE community_id = $1 AND (author_user_id = $2 OR subject_user_id = $2)`,
+      [input.actor.communityId, input.actor.userId],
+    );
+
     // Remove the authentication identity and credentials as well as sessions.
     // Better Auth uses its default model names here (`user`, `account`,
     // `session`, `verification`); this app's separate `users` row remains as

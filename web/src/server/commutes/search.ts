@@ -1,4 +1,5 @@
 import { isValidDateOnly, normalizeArea, parseClockMinutes } from "@/domain/clock";
+import { coverageRatio, isValidPoint, matchLegOnRoute, type GeoPoint } from "@/domain/geo";
 import type { AuthenticatedActor } from "@/server/auth/actor";
 import { getPool } from "@/server/db/pool";
 import { invalid } from "@/server/rides/errors";
@@ -24,6 +25,29 @@ export type RideCandidate = {
    */
   originMatch: "EXACT" | "PROXIMITY";
   destinationMatch: "EXACT" | "PROXIMITY";
+  /**
+   * The driver's path, when the trip stores one. Absent for trips published before
+   * route geometry existed, which is what makes route matching additive rather
+   * than a breaking change.
+   */
+  routePoints: GeoPoint[] | null;
+};
+
+/**
+ * A candidate that was matched by geometry, with the numbers the UI needs to be
+ * honest about the match.
+ */
+export type RouteMatchedCandidate = RideCandidate & {
+  routeMatch: {
+    /** The rider's ride length measured along the driver's route. */
+    rideDistanceMeters: number;
+    routeDistanceMeters: number;
+    /** Fraction of the driver's route the rider is on board for, 0..1. */
+    coverage: number;
+    /** How far sideways each of the rider's pins is from the driver's road. */
+    originOffsetMeters: number;
+    destinationOffsetMeters: number;
+  };
 };
 
 export async function searchRideCandidates(input: {
@@ -41,6 +65,16 @@ export async function searchRideCandidates(input: {
    * matching entirely, leaving exact/alias matching.
    */
   areaRadiusMeters: number;
+  /**
+   * Route-corridor query, when the rider picked map points rather than typing area
+   * names. Absent means "use the area/alias matching", which is what every existing
+   * caller does.
+   *
+   * `lateralToleranceMeters` is server-controlled for the same reason
+   * `areaRadiusMeters` is: a client that could set it would match every trip in the
+   * marketplace by widening the corridor to the whole country.
+   */
+  routeQuery?: { legStart: GeoPoint; legEnd: GeoPoint; lateralToleranceMeters: number } | null;
 }): Promise<RideCandidate[]> {
   assertParticipantRole(input.actor.participantRole, "RIDER");
   if (!isValidDateOnly(input.tripDate)) {
@@ -87,6 +121,7 @@ export async function searchRideCandidates(input: {
       contribution_note: string | null;
       origin_match: "EXACT" | "PROXIMITY";
       destination_match: "EXACT" | "PROXIMITY";
+      route_points: unknown;
     }>(
       `WITH search AS (
          SELECT $1::uuid AS community_id,
@@ -149,7 +184,10 @@ export async function searchRideCandidates(input: {
                      (SELECT a.canonical_area FROM area_aliases a
                        WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
                      s.destination_area)
-                   THEN 'EXACT' ELSE 'PROXIMITY' END AS destination_match,
+                         THEN 'EXACT' ELSE 'PROXIMITY' END AS destination_match,
+              -- The trip's own snapshotted path, for corridor matching. Null for a
+              -- trip published before geometry existed.
+              o.route_points,
               CASE
                 WHEN s.desired_minute < candidate.local_departure_minute
                   THEN candidate.local_departure_minute - s.desired_minute
@@ -188,32 +226,43 @@ export async function searchRideCandidates(input: {
           AND t.role IN ('OFFERING', 'EITHER')
           AND t.seats_offered > 0
           AND t.owner_user_id <> s.viewer_id
-          -- An origin/destination side matches when the resolved names are equal
-          -- (exact, or via an operator alias) OR when both sides have coordinates
-          -- and are within the configured radius. Proximity is a fallback: it can
-          -- only widen matching between two areas an operator has placed, it
-          -- never guesses a location from a name.
+          -- Area matching is skipped entirely when the rider picked map points
+          -- ($9): the geometry decides, and gating on names first would exclude a
+          -- rider whose leg is genuinely on the corridor simply because their
+          -- pickup is called "Rana Town" and the driver's origin "Muridke".
+          --
+          -- Otherwise: an origin/destination side matches when the resolved names
+          -- are equal (exact, or via an operator alias) OR when both sides have
+          -- coordinates and are within the configured radius. Proximity is a
+          -- fallback: it can only widen matching between two areas an operator has
+          -- placed, it never guesses a location from a name.
           AND (
-            lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
-                  (SELECT a.canonical_area FROM area_aliases a
-                    WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g'))),
-                  s.origin_area)
-            OR area_within_radius(
-                 s.community_id,
-                 s.origin_latitude, s.origin_longitude,
-                 lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')),
-                 s.radius_meters)
+            $9::boolean
+            OR (
+              lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                    (SELECT a.canonical_area FROM area_aliases a
+                      WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g'))),
+                    s.origin_area)
+              OR area_within_radius(
+                   s.community_id,
+                   s.origin_latitude, s.origin_longitude,
+                   lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')),
+                   s.radius_meters)
+            )
           )
           AND (
-            lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
-                  (SELECT a.canonical_area FROM area_aliases a
-                    WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
-                  s.destination_area)
-            OR area_within_radius(
-                 s.community_id,
-                 s.destination_latitude, s.destination_longitude,
-                 lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')),
-                 s.radius_meters)
+            $9::boolean
+            OR (
+              lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                    (SELECT a.canonical_area FROM area_aliases a
+                      WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
+                    s.destination_area)
+              OR area_within_radius(
+                   s.community_id,
+                   s.destination_latitude, s.destination_longitude,
+                   lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')),
+                   s.radius_meters)
+            )
           )
           AND abs(candidate.local_departure_minute - s.desired_minute) <= s.tolerance_minutes
           AND NOT EXISTS (
@@ -234,10 +283,13 @@ export async function searchRideCandidates(input: {
         destinationArea,
         input.timeToleranceMinutes,
         input.areaRadiusMeters,
+        // When a route query is present the geometry decides, so the area
+        // predicate must not filter the candidate out before it can be projected.
+        input.routeQuery != null,
       ],
     );
 
-  return result.rows.map((row) => ({
+  const candidates = result.rows.map((row) => ({
       commuteTemplateId: row.commute_template_id,
       tripOccurrenceId: row.trip_occurrence_id,
       memberId: row.member_id,
@@ -250,5 +302,86 @@ export async function searchRideCandidates(input: {
       contributionNote: row.contribution_note,
       originMatch: row.origin_match,
       destinationMatch: row.destination_match,
+      // Validated rather than trusted: the JSON is written by our own code, but a
+      // malformed point would make every projection silently wrong, and a route is
+      // exactly the kind of data where a wrong answer looks like a right one.
+      routePoints: parseRoutePoints(row.route_points),
   }));
+
+  // Route-corridor matching, when the rider supplied map points and the driver's
+  // trip carries a path.
+  //
+  // The SQL above is deliberately left as the coarse filter: it is good at the
+  // cheap, indexed conditions (date, time window, seats, blocks, and a name or
+  // bounding-box hit). Deciding whether a rider's leg lies *along* a route needs
+  // projection onto a polyline, which is clearer and more testable in TypeScript
+  // than in SQL, and by this point the candidate set is small — one date and a
+  // corridor, not the whole table.
+  if (input.routeQuery) {
+    return rankByRoute(candidates, input.routeQuery);
+  }
+
+  return candidates;
+}
+
+type CandidateRow = Awaited<ReturnType<typeof searchRideCandidates>>[number];
+
+/**
+ * Read a stored route, discarding it entirely if any point is malformed.
+ *
+ * Partial trust would be worse than none: a route with one bad point would
+ * project riders onto a line that does not exist, and the result would look like a
+ * normal match rather than an error.
+ */
+function parseRoutePoints(value: unknown): GeoPoint[] | null {
+  if (!Array.isArray(value) || value.length < 2) return null;
+  if (!value.every(isValidPoint)) return null;
+  return value as GeoPoint[];
+}
+
+/**
+ * Keep only the candidates whose route actually carries the rider's leg, best
+ * first.
+ *
+ * A candidate with no stored route is dropped rather than guessed at: matching it
+ * would mean falling back to comparing names, which is the behaviour this replaces
+ * and which would produce a different (worse) answer in the same list. The caller
+ * can still search without points and get the old behaviour deliberately.
+ *
+ * Ranking is by how much of the driver's route the rider is actually on board
+ * for: a rider covering most of the route is a better match for both parties than
+ * one hopping a single stop, and without this the list is ordered by departure
+ * time alone and the useful rows can sit at the bottom.
+ */
+function rankByRoute(
+  candidates: CandidateRow[],
+  query: { legStart: GeoPoint; legEnd: GeoPoint; lateralToleranceMeters: number },
+): RouteMatchedCandidate[] {
+  const matched: RouteMatchedCandidate[] = [];
+  for (const candidate of candidates) {
+    const route = candidate.routePoints;
+    if (!route || route.length < 2) continue;
+    const outcome = matchLegOnRoute({
+      legStart: query.legStart,
+      legEnd: query.legEnd,
+      route,
+      lateralToleranceMeters: query.lateralToleranceMeters,
+    });
+    if (!outcome.matched) continue;
+    matched.push({
+      ...candidate,
+      routeMatch: {
+        rideDistanceMeters: Math.round(outcome.rideDistanceMeters),
+        routeDistanceMeters: Math.round(outcome.routeDistanceMeters),
+        coverage: Math.round(coverageRatio(outcome) * 100) / 100,
+        // How far sideways the rider's own two pins are from the driver's road.
+        // Surfaced so the UI can say "2 min off the route" honestly rather than
+        // implying the pins are exactly on it.
+        originOffsetMeters: Math.round(outcome.originLateralMeters),
+        destinationOffsetMeters: Math.round(outcome.destinationLateralMeters),
+      },
+    });
+  }
+  matched.sort((a, b) => b.routeMatch.coverage - a.routeMatch.coverage || a.departureDifferenceMinutes - b.departureDifferenceMinutes);
+  return matched;
 }

@@ -30,7 +30,7 @@ For hosted/non-local environments, configure a verified email sender with `RESEN
 
 ## Database
 
-Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community; 0024 requires both confirmations for a completed request; 0025 adds the `TRIP_DISPUTE_RESOLVED` notification kind that the reviewer resolution writes; 0026 adds operator-recorded area coordinates and the `area_within_radius` distance function for nearby-area matching. Do not run migrations against a shared/production database unless that is the intended operation.
+Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community; 0024 requires both confirmations for a completed request; 0025 adds the `TRIP_DISPUTE_RESOLVED` notification kind that the reviewer resolution writes; 0026 adds operator-recorded area coordinates and the `area_within_radius` distance function for nearby-area matching; 0027 adds the per-trip meeting detail each participant shares with the other (and the trigger that clears it whenever the seat stops being confirmed); 0028 adds the `MEETING_DETAIL_SHARED` notification kind. Do not run migrations against a shared/production database unless that is the intended operation.
 
 If a migration file is edited after it was applied, the runner refuses to continue (it would silently apply a different schema than the database holds). After verifying the live schema by hand, reconcile only that file with `node ./scripts/migrate.mjs --rebaseline-checksum=<filename>`; it records the new checksum and does not re-run any SQL. Use it deliberately, and prefer a new migration whenever the change is not purely documentary.
 
@@ -75,6 +75,60 @@ the closure mirror drifted from the service it claimed to check, and how a real
 `npm run db:prune-history` applies a retention window to the core ride history that previously had none. It deletes at most 500 rows per invocation (override with `--limit=<n>`, max 10000) and only settled history older than the window (default 365 days; `--retention-days=<n>` or `HISTORY_RETENTION_DAYS`). Three rules keep it safe: a trip must be `COMPLETED`/`CANCELLED` (never an open commitment), a trip referenced by any safety report is skipped entirely (evidence outlives the ride), and deletion follows the schema's `RESTRICT` foreign keys (notifications → evidence → disputes → requests → trips). `commute_templates` is never touched — a template is a reusable definition, not history. Use `--dry-run` to preview; it always prints what it declined to delete and why.
 
 `npm run db:maintenance` runs all three cleanup commands (notifications, idempotency, history) in one invocation so an environment schedules a single job, and accepts `--dry-run` to preview every step. It exits non-zero if any step failed. The app schedules none of this itself — configure a periodic job in each environment.
+
+## Route-corridor matching (the map/pin model)
+
+The product requirement: a driver going **Muridke → Model Town Lahore** should match a rider going **Rana Town → MAO College**, because the rider's leg lies along the driver's route — regardless of how far apart the names are and with no fixed radius. `ROUTE_MATCHING_PLAN.md` has the design; `src/domain/geo.ts` has the logic.
+
+A leg **A→B** matches a route **P→Q** when all four hold:
+
+1. both A and B are within `lateralToleranceMeters` of the polyline (how far *sideways* off the road);
+2. `along(A) < along(B)` — the rider boards before they alight. **This is the rule a radius cannot express**, and the one that rejects a rider travelling the opposite way;
+3. both fall inside the route's own extent (not before P or past Q);
+4. A and B are distinct points.
+
+Distance *along* the route is measured by projecting each endpoint onto the nearest segment and accumulating real segment lengths, so it is distance travelled on the road rather than a straight line. Search uses SQL for the cheap indexed filters (date, time window, seats, blocks) and applies the geometry in TypeScript on that small candidate set, ranking by the fraction of the driver's route the rider is on board for.
+
+**Nothing that worked before changed.** Every geometry column is nullable; passing no map points uses the area/alias matching exactly as before, and a trip with no stored route falls back to it. A stored route is validated when read — one malformed point discards the whole route, because projecting onto a partly-broken line yields a confident match on a road that does not exist.
+
+**What is not yet real:** the geometry is currently synthetic (a hand-made corridor in tests), not from a routing provider, so "follows real navigation" is not yet true — see `ROUTE_MATCHING_PLAN.md` §6.2 for the provider choice. There is no map UI and no live tracking yet.
+
+## Profiles, phone and vehicle (ride-hailing Phase 1a)
+
+`GET /api/profile` returns your own profile; `PATCH /api/profile` updates it (`displayName`, `phone`, and for a driver a `vehicle` object — send `vehicle: null` to remove it). `driver_vehicles` holds one vehicle per driver, enforced by a unique index. The dashboard exposes this under **Your profile**, where the vehicle fields appear only in Driver mode.
+
+Who may see someone else's phone and vehicle is the load-bearing rule, and it is the same one the meeting detail uses:
+
+- `GET /api/rides/{requestId}/counterpart` returns the other participant's name, phone, and vehicle **only** when the caller is a participant on that request **and** the request is `ACCEPTED`. Otherwise it returns `{ "identity": null }`.
+- It returns `null` rather than `404` deliberately: a distinct status would tell a stranger whether a given request exists and carries a phone number.
+- A changed `phone` clears `phone_verified_at`, so a number cannot inherit an earlier number's verification.
+
+The phone is stored as digits with an optional leading `+`; local (`0300 1234567`) and international (`+92 300 1234567`) forms are both accepted. **SMS verification is not implemented** — it needs a provider and a budget — so the UI shows the number as unverified rather than implying it was checked.
+
+## Ratings (ride-hailing Phase 1b)
+
+After a trip is `COMPLETED`, either participant rates the other 1–5 with an optional comment.
+
+- `POST /api/rides/{requestId}/rating` with `{ "score": 1..5, "comment": "…" }`. There is **no `PUT`/`PATCH`/`DELETE`** on purpose: a rating cannot be changed or withdrawn once submitted, and the database refuses both regardless of caller.
+- `GET /api/ratings` returns `{ ratings, authoredRequestIds }` — the ratings written *about* you, and the request ids *you* have rated. The second is what tells the dashboard a completed trip still needs a rating; deriving it from the first was a bug, because a rating you write appears in the recipient's list.
+- The counterpart card shows an average only once at least three ratings exist (`MIN_RATINGS_FOR_AVERAGE`); below that it says how many there are and shows no score, because one five-star rating is not a reputation.
+
+**Nothing acts on a rating automatically** — no suspension, warning or de-ranking. That is a fairness decision, recorded as the owner's to make (`RIDE_HAILING_ROADMAP.md` §4), not a default.
+
+Immutability is enforced by a trigger with three distinct cases (migration `0031`): an `UPDATE` is always refused; a nested delete — a ride being removed by `db:prune-history` — is allowed; and an explicit erasure transaction sets `SET LOCAL app.allow_rating_erasure = 'on'`, which account closure does so a closed person's ratings are erased rather than left naming a tombstone. Only that flag may delete a rating directly, so every such place is findable by search.
+
+## Meeting details (exchanging the exact pickup)
+
+Areas are deliberately approximate, so once a driver accepts a seat either participant can add a **meeting detail** — an exact pickup point, a landmark, or a contact number — at `PUT /api/rides/{requestId}/meeting-detail` with `{ "detail": "…" }` (a blank value withdraws it). Each participant's text lives in its own column (`driver_meeting_detail` / `rider_meeting_detail`), so neither can rewrite the other's.
+
+The access rule is the point of the feature, and it is enforced in the database, not only the UI:
+
+- A detail is readable and writable **only while the request is `ACCEPTED`**. The read query masks both columns to `NULL` at any other status, so a pending or declined request reveals nothing even if a row somehow carried text.
+- A trigger clears both columns the moment a request leaves `ACCEPTED` — driver cancellation, rider cancellation, decline, expiry sweep, account closure, or a reviewer dispute decision. One rule, not six call sites that each have to remember.
+- `npm run health-check` asserts the invariant directly (`no meeting detail is retained on a non-accepted request`), so a dropped trigger is a deployment failure rather than a quiet leak.
+- The notification that tells the other participant a detail was shared deliberately carries **no** detail text: inbox rows are stored and polled broadly, and a phone number there would be readable well beyond the ride.
+
+The values are **not** encrypted at rest. The threat this addresses is other *users*, not the database operator, who can read any table; encrypting with an application-held key would imply a guarantee this design does not make.
 
 To review reports and disputes, promote an account with the bundled command after it has signed in once:
 
