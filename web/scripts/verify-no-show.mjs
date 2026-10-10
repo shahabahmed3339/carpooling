@@ -26,85 +26,74 @@ const CID = "00000000-0000-4000-8000-000000000002";
 const results = [];
 const check = (name, pass, detail) => results.push({ name, pass, detail });
 
+/** Create an active account with an auth row; returns its ids. */
+async function createAccount() {
+  const userId = randomUUID();
+  const authId = randomUUID();
+  await pool.query(
+    `INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+     VALUES ($1, 'ns fixture', $2, true, now(), now())`,
+    [authId, `ns-${userId}@verify.local`],
+  );
+  await pool.query(
+    `INSERT INTO users (id, auth_subject, display_name, participant_role, status)
+     VALUES ($1, $2, 'ns fixture', 'DRIVER', 'ACTIVE')`,
+    [userId, authId],
+  );
+  await pool.query(
+    `INSERT INTO community_memberships (community_id, user_id, status, role, reviewed_by, reviewed_at)
+     VALUES ($1, $2, 'ACTIVE', 'MEMBER', $2, now())`,
+    [CID, userId],
+  );
+  return { userId, authId };
+}
+
+/** Remove fixtures left by an earlier interrupted run (marker: `nsGulberg`). */
+async function removeOrphanedFixtures() {
+  await pool.query(
+    `DELETE FROM trip_no_show_evidence WHERE ride_request_id IN (
+       SELECT r.id FROM ride_requests r
+        JOIN trip_occurrences o ON o.id = r.trip_occurrence_id
+       WHERE o.origin_area = 'nsGulberg')`,
+  ).catch(() => {});
+  await pool.query(
+    `DELETE FROM ride_requests WHERE trip_occurrence_id IN (
+       SELECT id FROM trip_occurrences WHERE origin_area = 'nsGulberg')`,
+  ).catch(() => {});
+  await pool.query("DELETE FROM trip_occurrences WHERE origin_area = 'nsGulberg'").catch(() => {});
+  await pool.query("DELETE FROM commute_templates WHERE origin_area = 'nsGulberg'").catch(() => {});
+  await pool.query("DELETE FROM community_memberships WHERE user_id IN (SELECT id FROM users WHERE display_name = 'ns fixture')").catch(() => {});
+  await pool.query("DELETE FROM users WHERE display_name = 'ns fixture'").catch(() => {});
+  await pool.query(`DELETE FROM "user" WHERE email LIKE 'ns-%@verify.local'`).catch(() => {});
+}
+
 /**
- * The canonical sweep, mirroring src/server/rides/completion.ts. Kept in sync by
- * the invariant checker: if these diverge, evidence stops matching its request.
+ * The real sweep, imported from the server source. The previous version mirrored
+ * its SQL ("mirroring src/server/rides/completion.ts") and was kept in sync only
+ * by hand — the same drift risk that let a broken dispute path pass its own test.
+ * Importing the module means this exercises the sweep the app actually runs.
  */
-async function runSweep(client) {
-  const expired = await client.query(
-    `UPDATE ride_requests r
-        SET status = 'EXPIRED', updated_at = now()
-       FROM trip_occurrences o
-      WHERE o.id = r.trip_occurrence_id
-        AND r.status = 'ACCEPTED'
-        AND o.status = 'OPEN'
-        AND o.departure_at < now() - (SELECT completion_window FROM trip_policy WHERE id = true)
-      RETURNING r.id, r.community_id,
-                r.rider_confirmed_completion, r.driver_confirmed_completion,
-                o.departure_at AS departed_at`,
-  );
+const { expireStaleTrips } = await import("@/server/rides/completion");
 
-  let recorded = 0;
-  for (const row of expired.rows) {
-    const outcome = row.rider_confirmed_completion && row.driver_confirmed_completion
-      ? "BOTH_CONFIRMED"
-      : row.rider_confirmed_completion
-        ? "DRIVER_UNCONFIRMED"
-        : row.driver_confirmed_completion
-          ? "RIDER_UNCONFIRMED"
-          : "NEITHER_CONFIRMED";
-    const inserted = await client.query(
-      `INSERT INTO trip_no_show_evidence
-         (ride_request_id, community_id, outcome, rider_confirmed, driver_confirmed, departed_at)
-       VALUES ($1,$2,$3,$4,$5,$6)
-       ON CONFLICT (ride_request_id) DO NOTHING`,
-      [row.id, row.community_id, outcome, row.rider_confirmed_completion, row.driver_confirmed_completion, row.departed_at],
-    );
-    recorded += inserted.rowCount ?? 0;
-  }
-
-  const abandoned = await client.query(
-    `UPDATE ride_requests r
-        SET status = 'EXPIRED', updated_at = now()
-       FROM trip_occurrences o
-      WHERE o.id = r.trip_occurrence_id
-        AND r.status = 'REQUESTED'
-        AND o.status <> 'CANCELLED'
-        AND o.departure_at <= now()`,
-  );
-
-  const trips = await client.query(
-    `UPDATE trip_occurrences o
-        SET status = 'COMPLETED', seats_reserved = 0, updated_at = now()
-      WHERE o.status = 'OPEN'
-        AND o.departure_at < now()
-        AND NOT EXISTS (
-          SELECT 1 FROM ride_requests r
-           WHERE r.trip_occurrence_id = o.id AND r.status = 'ACCEPTED'
-        )`,
-  );
-
-  return {
-    requestsExpired: (expired.rowCount ?? 0) + (abandoned.rowCount ?? 0),
-    tripsCompleted: trips.rowCount ?? 0,
-    noShowEvidenceRecorded: recorded,
-  };
+/** Run the real sweep. It opens its own transaction, so no fixture may be held. */
+async function runSweep() {
+  return expireStaleTrips();
 }
 
 async function main() {
-  const accounts = await pool.query(
-    `SELECT u.id FROM users u
-      JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
-     WHERE u.status = 'ACTIVE' AND m.status = 'ACTIVE' LIMIT 2`,
-    [CID],
-  );
-  if (accounts.rowCount < 2) throw new Error("need two active accounts to build a fixture");
-  const [driver, rider] = accounts.rows;
+  await removeOrphanedFixtures();
+
+  // Own the driver/rider accounts instead of borrowing the first two ACTIVE rows:
+  // a borrowed account can be a reviewer, which silently changes what the test
+  // measures. All writes go through `pool` in autocommit because the real sweep
+  // opens its own transaction and must not be blocked by a held fixture one.
+  const driver = await createAccount();
+  const rider = await createAccount();
 
   const commuteId = randomUUID();
   const tripId = randomUUID();
   const requestId = randomUUID();
-  const client = await pool.connect();
+  const client = pool;
 
   try {
     await client.query(
@@ -112,7 +101,7 @@ async function main() {
          (id, community_id, owner_user_id, origin_area, destination_area,
           departure_window_start, departure_window_end, role, seats_offered)
        VALUES ($1,$2,$3,'nsGulberg','nsDHA','08:00','08:20','OFFERING',1)`,
-      [commuteId, CID, driver.id],
+      [commuteId, CID, driver.userId],
     );
     await client.query(
       `INSERT INTO trip_occurrences
@@ -121,17 +110,17 @@ async function main() {
           seat_capacity, seats_reserved, status)
        VALUES ($1,$2,$3,$4,(now() AT TIME ZONE 'Asia/Karachi')::date - 2,
                now() - interval '48 hours','Asia/Karachi','nsGulberg','nsDHA',1,1,'OPEN')`,
-      [tripId, commuteId, CID, driver.id],
+      [tripId, commuteId, CID, driver.userId],
     );
     await client.query(
       `INSERT INTO ride_requests
          (id, trip_occurrence_id, community_id, rider_user_id, status,
           accepted_at, rider_confirmed_completion, driver_confirmed_completion)
        VALUES ($1,$2,$3,$4,'ACCEPTED', now() - interval '48 hours', true, false)`,
-      [requestId, tripId, CID, rider.id],
+      [requestId, tripId, CID, rider.userId],
     );
 
-    const sweep = await runSweep(client);
+    const sweep = await runSweep();
     check("sweep expired at least one request", sweep.requestsExpired >= 1, JSON.stringify(sweep));
     check("sweep recorded evidence", sweep.noShowEvidenceRecorded >= 1, JSON.stringify(sweep));
 
@@ -161,7 +150,7 @@ async function main() {
       JSON.stringify(trip.rows[0]),
     );
 
-    const second = await runSweep(client);
+    const second = await runSweep();
     const after = await client.query(
       "SELECT count(*)::int AS n FROM trip_no_show_evidence WHERE ride_request_id = $1",
       [requestId],
@@ -169,11 +158,15 @@ async function main() {
     check("re-running does not duplicate evidence", after.rows[0]?.n === 1, JSON.stringify(after.rows));
     check("second sweep records no new evidence", second.noShowEvidenceRecorded === 0, JSON.stringify(second));
   } finally {
-    await client.query("DELETE FROM trip_no_show_evidence WHERE ride_request_id = $1", [requestId]).catch(() => {});
-    await client.query("DELETE FROM ride_requests WHERE id = $1", [requestId]).catch(() => {});
-    await client.query("DELETE FROM trip_occurrences WHERE id = $1", [tripId]).catch(() => {});
-    await client.query("DELETE FROM commute_templates WHERE id = $1", [commuteId]).catch(() => {});
-    client.release();
+    await pool.query("DELETE FROM trip_no_show_evidence WHERE ride_request_id = $1", [requestId]).catch(() => {});
+    await pool.query("DELETE FROM ride_requests WHERE id = $1", [requestId]).catch(() => {});
+    await pool.query("DELETE FROM trip_occurrences WHERE id = $1", [tripId]).catch(() => {});
+    await pool.query("DELETE FROM commute_templates WHERE id = $1", [commuteId]).catch(() => {});
+    for (const account of [driver, rider]) {
+      await pool.query("DELETE FROM community_memberships WHERE user_id = $1", [account.userId]).catch(() => {});
+      await pool.query("DELETE FROM users WHERE id = $1", [account.userId]).catch(() => {});
+      await pool.query('DELETE FROM "user" WHERE id = $1', [account.authId]).catch(() => {});
+    }
   }
 
   let failed = 0;

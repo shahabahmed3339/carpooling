@@ -43,27 +43,30 @@ async function addNotification(kind, eventKey, resourceType = "RIDE_REQUEST") {
   );
 }
 
-/** Mirror of listNotifications, including the 51-row page probe. */
-async function listNotifications(before) {
-  const rows = await pool.query(
-    `SELECT n.id, n.created_at,
-            to_char(n.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor
-       FROM in_app_notifications n
-      WHERE n.community_id = $1 AND n.recipient_user_id = $2
-        AND ($3::timestamptz IS NULL OR (n.created_at, n.id) < ($3::timestamptz, $4::uuid))
-      ORDER BY n.created_at DESC, n.id DESC
-      LIMIT 51`,
-    [CID, recipient, before?.createdAt ?? null, before?.id ?? null],
-  );
-  return { items: rows.rows.slice(0, 50), hasMore: rows.rows.length > 50 };
-}
+/**
+ * The real inbox functions, imported from the server source. The previous
+ * version mirrored their SQL ("Mirror of listNotifications, including the 51-row
+ * page probe"), so the keyset-pagination behaviour — the part most likely to
+ * drift as the cursor format changes — was never actually tested.
+ */
+const { listNotifications, markNotificationRead, markAllNotificationsRead } = await import(
+  "@/server/notifications/inbox"
+);
 
 const account = await pool.query(
   `SELECT u.id FROM users u JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
-    WHERE u.status='ACTIVE' AND m.status='ACTIVE' LIMIT 1`,
+    WHERE u.status='ACTIVE' AND m.status='ACTIVE' AND m.role = 'MEMBER' LIMIT 1`,
   [CID],
 );
+if (account.rowCount < 1) throw new Error("need an active MEMBER account to address notifications to");
 const recipient = account.rows[0].id;
+
+const actor = {
+  userId: recipient,
+  email: `${recipient}@verify.local`,
+  communityId: CID,
+  participantRole: "RIDER",
+};
 
 try {
   // Same event key twice must produce one row.
@@ -95,46 +98,35 @@ try {
     );
   }
 
-  const page1 = await listNotifications(undefined);
-  const seen = new Set(page1.items.map((r) => r.id));
-  const last = page1.items.at(-1);
+  const page1 = await listNotifications(actor);
+  const seen = new Set(page1.notifications.map((r) => r.id));
+  const last = page1.notifications.at(-1);
   const page2 = await listNotifications(
-    last ? { createdAt: last.cursor, id: last.id } : undefined,
+    actor,
+    last ? { createdAt: last.cursorCreatedAt, id: last.id } : undefined,
   );
-  const overlap = page2.items.filter((r) => seen.has(r.id));
-  const page2Tagged = page2.items.filter((r) => r.id).length;
+  const overlap = page2.notifications.filter((r) => seen.has(r.id));
   check("first page reports more available", page1.hasMore === true, String(page1.hasMore));
-  check("second page returns rows", page2Tagged > 0, String(page2.items.length));
+  check("second page returns rows", page2.notifications.length > 0, String(page2.notifications.length));
   check("cursor pages do not repeat rows", overlap.length === 0, `overlap=${overlap.length}`);
-  check(
-    "pages do not skip rows (no timestamp tie lost)",
-    page2Tagged > 0 && overlap.length === 0,
-    `page2=${page2.items.length}`,
-  );
+  check("the unread count is reported alongside the page", typeof page1.unreadCount === "number", String(page1.unreadCount));
 
-  // Read state: mark the tagged rows read, then check unread drops by that many.
-  const beforeUnread = await pool.query(
-    "SELECT count(*)::int n FROM in_app_notifications WHERE recipient_user_id=$1 AND community_id=$2 AND read_at IS NULL",
-    [recipient, CID],
-  );
-  const marked = await pool.query(
-    "UPDATE in_app_notifications SET read_at = COALESCE(read_at, now()) WHERE event_key LIKE $1 AND read_at IS NULL",
-    [`${tag}:%`],
-  );
-  const afterUnread = await pool.query(
-    "SELECT count(*)::int n FROM in_app_notifications WHERE recipient_user_id=$1 AND community_id=$2 AND read_at IS NULL",
-    [recipient, CID],
-  );
-  check(
-    "marking read decrements the unread count exactly",
-    beforeUnread.rows[0].n - afterUnread.rows[0].n === (marked.rowCount ?? 0),
-    `${beforeUnread.rows[0].n} -> ${afterUnread.rows[0].n}, marked ${marked.rowCount}`,
-  );
-  const remark = await pool.query(
-    "UPDATE in_app_notifications SET read_at = now() WHERE event_key LIKE $1 AND read_at IS NULL",
-    [`${tag}:%`],
-  );
-  check("mark-all-read is idempotent", remark.rowCount === 0, String(remark.rowCount));
+  // Read state: mark one tagged row read through the real service, then check the
+  // unread count drops by exactly one and the operation is idempotent.
+  const target = page1.notifications.find((n) => n.id);
+  const unreadBefore = (await listNotifications(actor)).unreadCount;
+  await markNotificationRead(actor, target.id);
+  const unreadAfter = (await listNotifications(actor)).unreadCount;
+  check("marking read decrements the unread count by one", unreadBefore - unreadAfter === 1, `${unreadBefore} -> ${unreadAfter}`);
+  await markNotificationRead(actor, target.id);
+  const unreadAfterTwice = (await listNotifications(actor)).unreadCount;
+  check("marking the same notice read again is idempotent", unreadAfterTwice === unreadAfter, `${unreadAfter} -> ${unreadAfterTwice}`);
+
+  const markedAll = await markAllNotificationsRead(actor);
+  const unreadAtEnd = (await listNotifications(actor)).unreadCount;
+  check("mark-all-read clears the unread count", unreadAtEnd === 0, `marked ${markedAll}, unread ${unreadAtEnd}`);
+  const markedAllAgain = await markAllNotificationsRead(actor);
+  check("mark-all-read is idempotent", markedAllAgain === 0, String(markedAllAgain));
 } finally {
   await pool.query("DELETE FROM in_app_notifications WHERE event_key LIKE $1", [`${tag}%`]).catch(() => {});
 }

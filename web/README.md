@@ -20,7 +20,7 @@ For hosted/non-local environments, configure a verified email sender with `RESEN
 - A seat request is not confirmed until the driver accepts it.
 - The mode is a dashboard/action context, not an account type. Both kinds of records belong to the same account.
 - Mode changes are serialized against role-gated writes; other open tabs reload after a switch, and the server rejects a stale-mode action even if a tab has not refreshed yet.
-- Area matching ignores capitalization and repeated spaces, but neighborhood names must still match; the app does not yet match nearby areas geographically.
+- Area matching ignores capitalization and repeated spaces. Two differently spelled areas also match when an operator declares an alias between them, and — once an operator records a coordinate for both areas — when they are within a server-configured radius (default 2 km). Distance applies only to areas an operator has placed; nothing is inferred from a name, and a distance-based result is labelled as such to the rider. See "Area coordinates" at `/moderation/reports`.
 - Users can block/unblock participants. Blocking affects future matching and new request acceptance; it does not cancel existing trips or requests.
 - Users can report a participant they share a trip or request with, and see the status of their own reports. The reviewer queue is at `/moderation/reports` and is limited to accounts whose membership role is `OPERATOR` or `SAFETY_REVIEWER`; assigning that role is a manual step (`npm run db:set-reviewer-role`). Since no external alert is sent, the queue must be checked deliberately.
 - Either participant can report that an accepted trip did not happen as agreed. It moves to `DISPUTED`, notifies active reviewers, and appears in the same moderation page; a reviewer records only whether the trip happened (`COMPLETED` or `EXPIRED`) and both participants are notified. Nothing is penalized automatically.
@@ -30,7 +30,7 @@ For hosted/non-local environments, configure a verified email sender with `RESEN
 
 ## Database
 
-Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community; 0024 requires both confirmations for a completed request; 0025 adds the `TRIP_DISPUTE_RESOLVED` notification kind that the reviewer resolution writes. Do not run migrations against a shared/production database unless that is the intended operation.
+Migrations live in `db/migrations`. `npm run db:migrate` applies unapplied migrations atomically, checks checksums, and uses an advisory lock. It changes only the database specified by `DATABASE_URL`; check that URL before running. Migration 0006 creates the automatic marketplace scope; 0007 indexes normalized area matching; 0008 adds safety reports; 0009 adds account closure; 0010–0012 add trip completion, capacity repair, and unconfirmed-trip evidence; 0013–0015 add in-app notifications; 0016 adds reviewer-only safety-report history; 0017/0019 add the append-only UPDATE/DELETE and TRUNCATE guards; 0018 adds the reviewer trip-dispute notification kind; 0020 indexes read notifications by age for retention cleanup; 0021 adds the optional display-only cost-sharing note; 0022 adds operator-declared area aliases; 0023 adds the support contact and hours on the community; 0024 requires both confirmations for a completed request; 0025 adds the `TRIP_DISPUTE_RESOLVED` notification kind that the reviewer resolution writes; 0026 adds operator-recorded area coordinates and the `area_within_radius` distance function for nearby-area matching. Do not run migrations against a shared/production database unless that is the intended operation.
 
 If a migration file is edited after it was applied, the runner refuses to continue (it would silently apply a different schema than the database holds). After verifying the live schema by hand, reconcile only that file with `node ./scripts/migrate.mjs --rebaseline-checksum=<filename>`; it records the new checksum and does not re-run any SQL. Use it deliberately, and prefer a new migration whenever the change is not purely documentary.
 
@@ -47,29 +47,34 @@ Retention across the rest of the data is not yet applied anywhere. `npm run db:a
 Two checks assert behaviour against live data rather than page text:
 
 ```bash
-node scripts/verify-completion.mjs       # schema invariants; exits non-zero if any fail
-node scripts/verify-no-show.mjs          # expiry evidence path, end to end (self-cleaning)
+npm run verify:completion                # schema invariants + REAL classifyOutcome (read-only)
+npm run verify:no-show                   # calls the REAL expireStaleTrips (self-cleaning)
 npm run verify:dispute                   # calls the REAL resolveTripDispute/listOpenTripDisputes (self-cleaning)
-node scripts/verify-account-closure.mjs  # calls the REAL deleteOwnAccount (self-cleaning)
-node scripts/verify-notifications.mjs    # event-key dedup, pagination, read state (self-cleaning)
-node scripts/verify-concurrency.mjs      # parallel accepts, double-accept, accept-vs-cancel (self-cleaning)
-node scripts/verify-contribution.mjs     # cost-sharing note copy-on-publish rules (self-cleaning)
+npm run verify:account-closure           # calls the REAL deleteOwnAccount (self-cleaning)
+npm run verify:notifications             # calls the REAL listNotifications/read APIs (self-cleaning)
+npm run verify:concurrency               # calls the REAL accept/cancel services under parallel load (self-cleaning)
+npm run verify:contribution              # calls the REAL createTripOccurrence (self-cleaning)
 node scripts/verify-integrity.mjs        # cross-table integrity for disputes/reports/closure (read-only)
 node scripts/verify-reviewer-role.mjs    # reviewer-role grant/refuse paths (self-cleaning)
 node scripts/verify-area-alias.mjs       # area-alias resolution and matching (self-cleaning)
 node scripts/verify-support.mjs          # support-contact read/write and operator gate (self-cleaning)
 ```
 
-`verify:dispute` and `verify:account-closure` import the real server services
-rather than re-implementing their SQL, using `scripts/lib/alias-loader.mjs`
-(which maps the `@/*` TypeScript path alias) via `node
---experimental-transform-types --import ./scripts/lib/register.mjs`. Prefer this
-approach for new checks: a script that copies the query it is testing verifies
-the copy, and will keep passing after the real code changes — which is how a
-broken dispute-resolution path stayed green, and how the closure mirror had
-already drifted from the service it claimed to check.
+Every script that exercises server behaviour now imports the real service or
+function rather than re-implementing its SQL, using `scripts/lib/alias-loader.mjs`
+(which maps the `@/*` TypeScript path alias and resolves extensionless relative
+imports) via `node --experimental-transform-types --import
+./scripts/lib/register.mjs`. Prefer this approach for new checks: a script that
+copies the query it is testing verifies the copy and keeps passing after the real
+code changes — which is how a broken dispute-resolution path stayed green, how
+the closure mirror drifted from the service it claimed to check, and how a real
+`40P01` accept deadlock went unseen.
 
 `npm run db:audit-retention` reports aged data volumes read-only, so a retention window can be chosen from real numbers.
+
+`npm run db:prune-history` applies a retention window to the core ride history that previously had none. It deletes at most 500 rows per invocation (override with `--limit=<n>`, max 10000) and only settled history older than the window (default 365 days; `--retention-days=<n>` or `HISTORY_RETENTION_DAYS`). Three rules keep it safe: a trip must be `COMPLETED`/`CANCELLED` (never an open commitment), a trip referenced by any safety report is skipped entirely (evidence outlives the ride), and deletion follows the schema's `RESTRICT` foreign keys (notifications → evidence → disputes → requests → trips). `commute_templates` is never touched — a template is a reusable definition, not history. Use `--dry-run` to preview; it always prints what it declined to delete and why.
+
+`npm run db:maintenance` runs all three cleanup commands (notifications, idempotency, history) in one invocation so an environment schedules a single job, and accepts `--dry-run` to preview every step. It exits non-zero if any step failed. The app schedules none of this itself — configure a periodic job in each environment.
 
 To review reports and disputes, promote an account with the bundled command after it has signed in once:
 

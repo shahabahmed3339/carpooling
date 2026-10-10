@@ -92,6 +92,7 @@ const REQUIRED = [
   ["trip_no_show_evidence", ["ride_request_id", "outcome"]],
   ["trip_policy", ["id", "completion_window"]],
   ["area_aliases", ["id", "community_id", "alias_area", "canonical_area"]],
+  ["area_coordinates", ["id", "community_id", "area", "latitude", "longitude"]],
   ["idempotency_records", ["actor_user_id", "operation", "key_sha256", "expires_at"]],
   ["schema_migrations", ["version", "checksum"]],
 ];
@@ -268,6 +269,20 @@ try {
       "no stray alias cycles",
       `SELECT a1.id FROM area_aliases a1
         JOIN area_aliases a2 ON a2.community_id = a1.community_id AND a2.alias_area = a1.canonical_area LIMIT 1`,
+    ],
+    [
+      "no area coordinate is outside valid latitude/longitude bounds",
+      `SELECT id FROM area_coordinates
+        WHERE latitude NOT BETWEEN -90 AND 90 OR longitude NOT BETWEEN -180 AND 180 LIMIT 1`,
+    ],
+    [
+      "no area coordinate is stored un-normalized",
+      `SELECT id FROM area_coordinates
+        WHERE area <> lower(regexp_replace(btrim(area), '[[:space:]]+', ' ', 'g')) LIMIT 1`,
+    ],
+    [
+      "no duplicate coordinate for one area in a community",
+      `SELECT community_id FROM area_coordinates GROUP BY community_id, area HAVING count(*) > 1 LIMIT 1`,
     ],
   ];
   const violated = [];

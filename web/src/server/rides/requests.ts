@@ -49,8 +49,12 @@ export async function requestSeat(input: {
   idempotencyKey: string;
 }): Promise<IdempotentResult<RequestResult>> {
   assertParticipantRole(input.actor.participantRole, "RIDER");
-  return inTransaction(async (client) =>
-    withIdempotency<RequestResult>({
+  return inTransaction(async (client) => {
+    // Take this account's advisory lock before the idempotency insert, so every
+    // transaction uses the same order (advisory locks, then rows) and concurrent
+    // requests cannot form an idempotency-row/advisory-lock cycle.
+    await lockUserActions(client, [input.actor.userId]);
+    return withIdempotency<RequestResult>({
       client,
       actorUserId: input.actor.userId,
       operation: "ride-request.create",
@@ -60,8 +64,22 @@ export async function requestSeat(input: {
         tripOccurrenceId: input.tripOccurrenceId,
       }),
       work: async () => {
-        await lockUserActions(client, [input.actor.userId]);
         await assertCurrentParticipantRole(client, input.actor.userId, "RIDER");
+
+        // Learn the driver without locking, so the advisory locks (account, then
+        // pair) can all be taken before the trip ROW lock. Taking the pair lock
+        // after the row lock lets concurrent requests on one trip acquire the
+        // shared row first and then contend on different pair locks, which
+        // Postgres resolves as a deadlock (40P01) rather than a clean outcome.
+        const driverLookup = await client.query<{ driver_user_id: string }>(
+          `SELECT driver_user_id FROM trip_occurrences WHERE id = $1 AND community_id = $2`,
+          [input.tripOccurrenceId, input.actor.communityId],
+        );
+        const driverUserId = driverLookup.rows[0]?.driver_user_id;
+        if (!driverUserId) throw notFound();
+        await lockUserActions(client, [driverUserId]);
+        const blocked = await usersAreBlocked(client, input.actor.userId, driverUserId);
+
         const trip = await client.query<{
           id: string;
           community_id: string;
@@ -87,7 +105,8 @@ export async function requestSeat(input: {
           throw conflict("SELF_RIDE_REQUEST", "You cannot request a seat on your own trip.");
         }
         await assertActiveCommunityMember(client, occurrence.community_id, occurrence.driver_user_id);
-        if (await usersAreBlocked(client, input.actor.userId, occurrence.driver_user_id)) {
+        // `blocked` was read under the pair lock taken before the trip row lock.
+        if (blocked) {
           throw notFound();
         }
         if (occurrence.status !== "OPEN" || occurrence.departure_at <= new Date()) {
@@ -149,8 +168,8 @@ export async function requestSeat(input: {
           },
         };
       },
-    }),
-  );
+    });
+  });
 }
 
 export async function createTripOccurrence(input: {
@@ -399,8 +418,15 @@ export async function acceptRideRequest(input: {
   idempotencyKey: string;
 }): Promise<IdempotentResult<RequestResult>> {
   assertParticipantRole(input.actor.participantRole, "DRIVER");
-  return inTransaction(async (client) =>
-    withIdempotency<RequestResult>({
+  return inTransaction(async (client) => {
+    // Serialize this account's mutations BEFORE the idempotency insert. All
+    // concurrent accepts by the same driver otherwise each take a row lock in the
+    // idempotency table and then contend on this account's advisory lock, which
+    // Postgres resolves as a deadlock (40P01) — observed with four riders racing
+    // for one trip, where three of four accepts failed. Taking the account lock
+    // first gives every transaction the same lock order: account, then rows.
+    await lockUserActions(client, [input.actor.userId]);
+    return withIdempotency<RequestResult>({
       client,
       actorUserId: input.actor.userId,
       operation: "ride-request.accept",
@@ -410,16 +436,30 @@ export async function acceptRideRequest(input: {
         requestId: input.requestId,
       }),
       work: async () => {
-        await lockUserActions(client, [input.actor.userId]);
         await assertCurrentParticipantRole(client, input.actor.userId, "DRIVER");
-        // Read the parent id, then lock in one global order (trip before request)
-        // so accept/cancel operations can share a deadlock-safe locking protocol.
-        const lookup = await client.query<{ trip_occurrence_id: string }>(
-          `SELECT trip_occurrence_id FROM ride_requests WHERE id = $1`,
+
+        // Read the request's parent trip and rider WITHOUT locking, only to learn
+        // the ids we must lock. Locking order matters: the advisory locks this
+        // operation needs (account, then pair) must all be taken before the trip
+        // and request ROW locks. Taking the pair lock after the trip row — as an
+        // earlier version did inside usersAreBlocked — lets four concurrent
+        // accepts on one trip acquire the shared trip row first and then contend
+        // on different pair locks, which Postgres resolves as a deadlock (40P01)
+        // instead of the intended NO_SEATS_AVAILABLE.
+        const lookup = await client.query<{ trip_occurrence_id: string; rider_user_id: string }>(
+          `SELECT trip_occurrence_id, rider_user_id FROM ride_requests WHERE id = $1`,
           [input.requestId],
         );
         const tripId = lookup.rows[0]?.trip_occurrence_id;
-        if (!tripId) throw notFound();
+        const riderUserId = lookup.rows[0]?.rider_user_id;
+        if (!tripId || !riderUserId) throw notFound();
+
+        // All advisory locks first, in a stable order: the driver's account lock
+        // (already held), the rider's account lock, then the driver/rider pair
+        // lock. Nothing here takes a row lock, so this cannot invert against
+        // another accept/cancel that follows the same order.
+        await lockUserActions(client, [riderUserId]);
+        const blocked = await usersAreBlocked(client, input.actor.userId, riderUserId);
 
         const tripResult = await client.query<{
           id: string;
@@ -473,7 +513,9 @@ export async function acceptRideRequest(input: {
         }
 
         await assertActiveCommunityMember(client, trip.community_id, request.rider_user_id);
-        if (await usersAreBlocked(client, trip.driver_user_id, request.rider_user_id)) {
+        // `blocked` was read under the pair lock taken before the trip row lock,
+        // so a concurrent block cannot slip in between.
+        if (blocked) {
           throw conflict("PARTICIPANT_BLOCKED", "This request can no longer be accepted.");
         }
 
@@ -525,8 +567,8 @@ export async function acceptRideRequest(input: {
           },
         };
       },
-    }),
-  );
+    });
+  });
 }
 
 /** Driver declines a pending request. The trip row is always locked first. */

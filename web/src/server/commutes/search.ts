@@ -15,6 +15,15 @@ export type RideCandidate = {
   availableSeats: number;
   departureDifferenceMinutes: number;
   contributionNote: string | null;
+  /**
+   * How the rider's searched area was matched to this trip's area. "EXACT" means
+   * the names matched (directly or through an operator alias); "PROXIMITY" means
+   * they differ and were bridged by operator-recorded coordinates. Surfaced so
+   * the dashboard can say so rather than silently presenting a different pickup
+   * point than the one the rider typed.
+   */
+  originMatch: "EXACT" | "PROXIMITY";
+  destinationMatch: "EXACT" | "PROXIMITY";
 };
 
 export async function searchRideCandidates(input: {
@@ -25,6 +34,13 @@ export async function searchRideCandidates(input: {
   desiredDeparture: string;
   /** Must come from the authenticated server actor, never directly from request JSON. */
   timeToleranceMinutes: number;
+  /**
+   * How far apart two areas may be and still match, in metres. Must come from
+   * server configuration, never directly from request JSON, so a client cannot
+   * widen matching to every trip in the marketplace. Zero disables proximity
+   * matching entirely, leaving exact/alias matching.
+   */
+  areaRadiusMeters: number;
 }): Promise<RideCandidate[]> {
   assertParticipantRole(input.actor.participantRole, "RIDER");
   if (!isValidDateOnly(input.tripDate)) {
@@ -49,6 +65,13 @@ export async function searchRideCandidates(input: {
   ) {
     throw invalid("INVALID_MATCH_CONFIGURATION", "The configured time tolerance is invalid.");
   }
+  if (
+    !Number.isInteger(input.areaRadiusMeters) ||
+    input.areaRadiusMeters < 0 ||
+    input.areaRadiusMeters > 50_000
+  ) {
+    throw invalid("INVALID_MATCH_CONFIGURATION", "The configured area radius is invalid.");
+  }
 
   const pool = getPool();
   const result = await pool.query<{
@@ -62,6 +85,8 @@ export async function searchRideCandidates(input: {
       available_seats: number;
       departure_difference_minutes: number;
       contribution_note: string | null;
+      origin_match: "EXACT" | "PROXIMITY";
+      destination_match: "EXACT" | "PROXIMITY";
     }>(
       `WITH search AS (
          SELECT $1::uuid AS community_id,
@@ -76,6 +101,30 @@ export async function searchRideCandidates(input: {
                 COALESCE((SELECT a.canonical_area FROM area_aliases a
                            WHERE a.community_id = $1 AND a.alias_area = $6), $6) AS destination_area,
                 $7::integer AS tolerance_minutes,
+                $8::double precision AS radius_meters,
+                -- The viewer's declared coordinates for each resolved side, if an
+                -- operator has recorded them. NULL means "no coordinate", which
+                -- falls back to exact matching alone.
+                (SELECT ac.latitude::double precision FROM area_coordinates ac
+                  WHERE ac.community_id = $1
+                    AND ac.area = COALESCE((SELECT a.canonical_area FROM area_aliases a
+                                             WHERE a.community_id = $1 AND a.alias_area = $5), $5)
+                  LIMIT 1) AS origin_latitude,
+                (SELECT ac.longitude::double precision FROM area_coordinates ac
+                  WHERE ac.community_id = $1
+                    AND ac.area = COALESCE((SELECT a.canonical_area FROM area_aliases a
+                                             WHERE a.community_id = $1 AND a.alias_area = $5), $5)
+                  LIMIT 1) AS origin_longitude,
+                (SELECT ac.latitude::double precision FROM area_coordinates ac
+                  WHERE ac.community_id = $1
+                    AND ac.area = COALESCE((SELECT a.canonical_area FROM area_aliases a
+                                             WHERE a.community_id = $1 AND a.alias_area = $6), $6)
+                  LIMIT 1) AS destination_latitude,
+                (SELECT ac.longitude::double precision FROM area_coordinates ac
+                  WHERE ac.community_id = $1
+                    AND ac.area = COALESCE((SELECT a.canonical_area FROM area_aliases a
+                                             WHERE a.community_id = $1 AND a.alias_area = $6), $6)
+                  LIMIT 1) AS destination_longitude,
                 (extract(hour FROM $4::time)::integer * 60
                   + extract(minute FROM $4::time)::integer) AS desired_minute
        )
@@ -88,6 +137,19 @@ export async function searchRideCandidates(input: {
               to_char(o.departure_at AT TIME ZONE o.timezone, 'HH24:MI') AS departure_time,
               (o.seat_capacity - o.seats_reserved)::integer AS available_seats,
               o.contribution_note,
+              -- Reports which rule admitted each side, re-evaluating the same
+              -- predicate the WHERE clause used. Equality/alias first; only when
+              -- that is false and the distance test passed is it "PROXIMITY".
+              CASE WHEN lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                     (SELECT a.canonical_area FROM area_aliases a
+                       WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g'))),
+                     s.origin_area)
+                   THEN 'EXACT' ELSE 'PROXIMITY' END AS origin_match,
+              CASE WHEN lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                     (SELECT a.canonical_area FROM area_aliases a
+                       WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
+                     s.destination_area)
+                   THEN 'EXACT' ELSE 'PROXIMITY' END AS destination_match,
               CASE
                 WHEN s.desired_minute < candidate.local_departure_minute
                   THEN candidate.local_departure_minute - s.desired_minute
@@ -126,14 +188,33 @@ export async function searchRideCandidates(input: {
           AND t.role IN ('OFFERING', 'EITHER')
           AND t.seats_offered > 0
           AND t.owner_user_id <> s.viewer_id
-          AND lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
-                (SELECT a.canonical_area FROM area_aliases a
-                  WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g'))),
-                s.origin_area)
-          AND lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
-                (SELECT a.canonical_area FROM area_aliases a
-                  WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
-                s.destination_area)
+          -- An origin/destination side matches when the resolved names are equal
+          -- (exact, or via an operator alias) OR when both sides have coordinates
+          -- and are within the configured radius. Proximity is a fallback: it can
+          -- only widen matching between two areas an operator has placed, it
+          -- never guesses a location from a name.
+          AND (
+            lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                  (SELECT a.canonical_area FROM area_aliases a
+                    WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g'))),
+                  s.origin_area)
+            OR area_within_radius(
+                 s.community_id,
+                 s.origin_latitude, s.origin_longitude,
+                 lower(regexp_replace(trim(t.origin_area), '[[:space:]]+', ' ', 'g')),
+                 s.radius_meters)
+          )
+          AND (
+            lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')) = COALESCE(
+                  (SELECT a.canonical_area FROM area_aliases a
+                    WHERE a.community_id = s.community_id AND a.alias_area = lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g'))),
+                  s.destination_area)
+            OR area_within_radius(
+                 s.community_id,
+                 s.destination_latitude, s.destination_longitude,
+                 lower(regexp_replace(trim(t.destination_area), '[[:space:]]+', ' ', 'g')),
+                 s.radius_meters)
+          )
           AND abs(candidate.local_departure_minute - s.desired_minute) <= s.tolerance_minutes
           AND NOT EXISTS (
             SELECT 1 FROM user_blocks b
@@ -152,6 +233,7 @@ export async function searchRideCandidates(input: {
         originArea,
         destinationArea,
         input.timeToleranceMinutes,
+        input.areaRadiusMeters,
       ],
     );
 
@@ -166,5 +248,7 @@ export async function searchRideCandidates(input: {
       availableSeats: row.available_seats,
       departureDifferenceMinutes: row.departure_difference_minutes,
       contributionNote: row.contribution_note,
+      originMatch: row.origin_match,
+      destinationMatch: row.destination_match,
   }));
 }

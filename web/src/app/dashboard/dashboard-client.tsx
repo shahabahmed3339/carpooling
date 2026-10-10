@@ -34,6 +34,8 @@ type Candidate = {
   availableSeats: number;
   departureDifferenceMinutes: number;
   contributionNote: string | null;
+  originMatch: "EXACT" | "PROXIMITY";
+  destinationMatch: "EXACT" | "PROXIMITY";
 };
 type RideRequest = {
   requestId: string;
@@ -842,7 +844,9 @@ export default function DashboardClient({ initialMode, accountEmail, accountId }
             <h2>Matching trips</h2>
             {candidates.length === 0 ? <p className={styles.muted}>Search to see available trips.</p> : candidates.map((candidate) => (
               <div className={styles.item} key={candidate.tripOccurrenceId}>
-                <div><strong>{candidate.originArea} → {candidate.destinationArea}</strong><p>{candidate.displayName} · {candidate.departureTime} · {candidate.availableSeats} seat(s){candidate.contributionNote ? ` · Cost sharing: ${candidate.contributionNote}` : ""}</p></div>
+                <div><strong>{candidate.originArea} → {candidate.destinationArea}</strong><p>{candidate.displayName} · {candidate.departureTime} · {candidate.availableSeats} seat(s){candidate.contributionNote ? ` · Cost sharing: ${candidate.contributionNote}` : ""}</p>
+                  {(candidate.originMatch === "PROXIMITY" || candidate.destinationMatch === "PROXIMITY") && <p className={styles.inlineMessage}>Near your {candidate.originMatch === "PROXIMITY" && candidate.destinationMatch === "PROXIMITY" ? "pickup and destination areas" : candidate.originMatch === "PROXIMITY" ? "pickup area" : "destination area"}, but not an exact name match. Confirm the meeting point with the driver before travelling.</p>}
+                </div>
                 <div className={styles.inline}>
                   <button disabled={busy || requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status))} onClick={() => void requestSeat(candidate)}>{requests.some((request) => request.tripOccurrenceId === candidate.tripOccurrenceId && ["REQUESTED", "ACCEPTED"].includes(request.status)) ? "Already requested" : "Request seat"}</button>
                   <button className={styles.secondary} disabled={busy} onClick={() => void setUserBlocked(candidate.memberId, candidate.displayName, true)}>Block</button>

@@ -33,6 +33,13 @@ const results = [];
 const check = (n, p, d) => results.push({ n, p, d });
 const tag = `cnt${randomUUID().slice(0, 8)}`;
 
+/**
+ * The real publish service, imported from the server source. The previous
+ * version mirrored its INSERT by hand (including the `contribution_note` copy),
+ * so a change to how a trip snapshots the note would not have been observed.
+ */
+const { createTripOccurrence } = await import("@/server/rides/requests");
+
 const account = await pool.query(
   `SELECT u.id FROM users u JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
     WHERE u.status='ACTIVE' AND m.status='ACTIVE' LIMIT 1`,
@@ -42,22 +49,21 @@ const driver = account.rows[0].id;
 const commuteId = randomUUID();
 const trips = [];
 
-async function publish(date, noteOverride) {
-  const tripId = randomUUID();
+/** Publish a date through the real service; returns the created trip row. */
+async function publish(date) {
+  const result = await createTripOccurrence({
+    actor: { userId: driver, email: `${driver}@verify.local`, communityId: CID, participantRole: "DRIVER" },
+    commuteTemplateId: commuteId,
+    tripDate: date,
+    idempotencyKey: randomUUID(),
+  });
+  const tripId = result.body.tripOccurrenceId;
   trips.push(tripId);
-  const published = await pool.query(
-    `INSERT INTO trip_occurrences
-       (id, commute_template_id, community_id, driver_user_id, trip_date, departure_at,
-        timezone, origin_area, destination_area, seat_capacity, seats_reserved, contribution_note)
-     SELECT $1, t.id, t.community_id, t.owner_user_id, $3::date,
-            ($3::date + t.departure_window_start) AT TIME ZONE t.timezone,
-            t.timezone, t.origin_area, t.destination_area, t.seats_offered, 0,
-            COALESCE($6::text, t.contribution_note)
-       FROM commute_templates t WHERE t.id = $2 AND t.community_id = $4 AND t.owner_user_id = $5
-      RETURNING id, contribution_note`,
-    [tripId, commuteId, date, CID, driver, noteOverride ?? null],
+  const row = await pool.query(
+    "SELECT id, contribution_note FROM trip_occurrences WHERE id = $1",
+    [tripId],
   );
-  return published.rows[0];
+  return row.rows[0];
 }
 
 try {
@@ -67,6 +73,13 @@ try {
      VALUES ($1,$2,$3,$4,$5,'08:00','08:20','OFFERING',2,'Share fuel cost')`,
     [commuteId, CID, driver, `${tag}G`, `${tag}D`],
   );
+  // The real publish service only accepts a date the commute's weekdays cover.
+  for (const weekday of [0, 1, 2]) {
+    await pool.query(
+      "INSERT INTO commute_template_weekdays (commute_template_id, weekday) VALUES ($1, $2)",
+      [commuteId, weekday],
+    );
+  }
 
   const first = await publish("2099-01-04");
   check("published trip exists", Boolean(first?.id), JSON.stringify(first));
@@ -93,18 +106,21 @@ try {
      VALUES ($1,$2,$3,$4,$5,'09:00','09:20','OFFERING',1,NULL)`,
     [commuteId2, CID, driver, `${tag}G2`, `${tag}D2`],
   );
-  const tripNone = randomUUID();
-  trips.push(tripNone);
+  await pool.query(
+    "INSERT INTO commute_template_weekdays (commute_template_id, weekday) VALUES ($1, 2)",
+    [commuteId2],
+  );
+  // Publish through the same real service under the no-note commute.
+  const noneResult = await createTripOccurrence({
+    actor: { userId: driver, email: `${driver}@verify.local`, communityId: CID, participantRole: "DRIVER" },
+    commuteTemplateId: commuteId2,
+    tripDate: "2099-01-06",
+    idempotencyKey: randomUUID(),
+  });
+  trips.push(noneResult.body.tripOccurrenceId);
   const noNote = await pool.query(
-    `INSERT INTO trip_occurrences
-       (id, commute_template_id, community_id, driver_user_id, trip_date, departure_at,
-        timezone, origin_area, destination_area, seat_capacity, seats_reserved, contribution_note)
-     SELECT $1, t.id, t.community_id, t.owner_user_id, $3::date,
-            ($3::date + t.departure_window_start) AT TIME ZONE t.timezone,
-            t.timezone, t.origin_area, t.destination_area, t.seats_offered, 0, t.contribution_note
-       FROM commute_templates t WHERE t.id = $2 AND t.community_id = $4 AND t.owner_user_id = $5
-      RETURNING contribution_note`,
-    [tripNone, commuteId2, "2099-01-06", CID, driver],
+    "SELECT contribution_note FROM trip_occurrences WHERE id = $1",
+    [noneResult.body.tripOccurrenceId],
   );
   check("an absent note is stored as NULL", noNote.rows[0]?.contribution_note === null, JSON.stringify(noNote.rows[0]));
 

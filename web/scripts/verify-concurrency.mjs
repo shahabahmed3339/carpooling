@@ -36,55 +36,28 @@ const check = (n, p, d) => results.push({ n, p, d });
 
 const tag = `conc${randomUUID().slice(0, 8)}`;
 
-/** Mirror the acceptance guard from requests.ts (acceptRideRequest). */
+/**
+ * The real ride services, imported from the server source. The previous version
+ * mirrored the acceptance guard by hand ("Mirror the acceptance guard from
+ * requests.ts"), which meant the concurrency test exercised a copy of the guard.
+ * The real `acceptRideRequest` also takes a per-account advisory lock via
+ * `lockUserActions`, which the mirror omitted entirely — so the mirror could not
+ * observe the serialization the real path relies on.
+ */
+const { acceptRideRequest, cancelTripOccurrence } = await import("@/server/rides/requests");
+
+function actorFor(userId) {
+  return { userId, email: `${userId}@verify.local`, communityId: CID, participantRole: "DRIVER" };
+}
+
+/** Accept a request through the real service. Returns ACCEPTED or REPLAY. */
 async function acceptRequest(tripId, requestId, driverId) {
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const trip = await client.query(
-      `SELECT id, driver_user_id, status, departure_at FROM trip_occurrences
-        WHERE id = $1 AND community_id = $2 FOR UPDATE`,
-      [tripId, CID],
-    );
-    const t = trip.rows[0];
-    if (!t) throw new Error("TRIP_NOT_FOUND");
-    if (t.driver_user_id !== driverId) throw new Error("FORBIDDEN");
-
-    const request = await client.query(
-      `SELECT id, rider_user_id, status FROM ride_requests
-        WHERE id = $1 AND trip_occurrence_id = $2 FOR UPDATE`,
-      [requestId, tripId],
-    );
-    const r = request.rows[0];
-    if (!r) throw new Error("REQUEST_NOT_FOUND");
-    if (r.status === "ACCEPTED") {
-      await client.query("COMMIT");
-      return "REPLAY";
-    }
-    if (r.status !== "REQUESTED") throw new Error("REQUEST_NOT_PENDING");
-    if (t.status !== "OPEN" || t.departure_at <= new Date()) throw new Error("TRIP_NOT_OPEN");
-
-    const reservation = await client.query(
-      `UPDATE trip_occurrences SET seats_reserved = seats_reserved + 1, updated_at = now()
-        WHERE id = $1 AND status = 'OPEN' AND seats_reserved < seat_capacity RETURNING id`,
-      [tripId],
-    );
-    if (reservation.rowCount !== 1) throw new Error("NO_SEATS_AVAILABLE");
-
-    const accepted = await client.query(
-      `UPDATE ride_requests SET status = 'ACCEPTED', accepted_at = now(), updated_at = now()
-        WHERE id = $1 AND status = 'REQUESTED' RETURNING id`,
-      [requestId],
-    );
-    if (accepted.rowCount !== 1) throw new Error("REQUEST_NOT_PENDING");
-    await client.query("COMMIT");
-    return "ACCEPTED";
-  } catch (error) {
-    await client.query("ROLLBACK").catch(() => {});
-    throw error;
-  } finally {
-    client.release();
-  }
+  const result = await acceptRideRequest({
+    actor: actorFor(driverId),
+    requestId,
+    idempotencyKey: randomUUID(),
+  });
+  return result.body.replayedOrExisting ? "REPLAY" : "ACCEPTED";
 }
 
 async function setup(driverId, riderIds, seats) {
@@ -129,14 +102,34 @@ async function cleanup({ commuteId, tripId }) {
   if (commuteId) await pool.query("DELETE FROM commute_templates WHERE id = $1", [commuteId]).catch(() => {});
 }
 
-const accounts = await pool.query(
-  `SELECT u.id FROM users u JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
-    WHERE u.status='ACTIVE' AND m.status='ACTIVE' LIMIT 6`,
-  [CID],
-);
-if (accounts.rowCount < 4) throw new Error("need at least four active accounts to build a fixture");
-const ids = accounts.rows.map((r) => r.id);
-const [driver, ...riders] = ids;
+// Own the fixture accounts: the real accept path checks the caller's current
+// participant role (DRIVER) and active membership in the database, so a borrowed
+// account may be the wrong role or a reviewer.
+const createdAccounts = [];
+async function createAccount() {
+  const userId = randomUUID();
+  const authId = randomUUID();
+  await pool.query(
+    `INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt")
+     VALUES ($1, 'conc fixture', $2, true, now(), now())`,
+    [authId, `conc-${userId}@verify.local`],
+  );
+  await pool.query(
+    `INSERT INTO users (id, auth_subject, display_name, participant_role, status)
+     VALUES ($1, $2, 'conc fixture', 'DRIVER', 'ACTIVE')`,
+    [userId, authId],
+  );
+  await pool.query(
+    `INSERT INTO community_memberships (community_id, user_id, status, role, reviewed_by, reviewed_at)
+     VALUES ($1, $2, 'ACTIVE', 'MEMBER', $2, now())`,
+    [CID, userId],
+  );
+  createdAccounts.push({ userId, authId });
+  return userId;
+}
+
+const driver = await createAccount();
+const riders = [await createAccount(), await createAccount(), await createAccount(), await createAccount()];
 
 // --- Case 1: N riders race for a single seat -------------------------------
 {
@@ -148,10 +141,21 @@ const [driver, ...riders] = ids;
     const accepted = outcomes.filter((o) => o.status === "fulfilled" && o.value === "ACCEPTED").length;
     const replayed = outcomes.filter((o) => o.status === "fulfilled" && o.value === "REPLAY").length;
     const failed = outcomes.filter((o) => o.status === "rejected").length;
-    const codes = outcomes.filter((o) => o.status === "rejected").map((o) => o.reason.message);
+    const codes = outcomes.filter((o) => o.status === "rejected").map((o) => o.reason.code);
 
     check("exactly one concurrent accept succeeds on a one-seat trip", accepted === 1, `accepted=${accepted} replayed=${replayed} failed=${failed}`);
     check("the losers are rejected for lack of seats", codes.every((c) => c === "NO_SEATS_AVAILABLE"), JSON.stringify(codes));
+    // Regression guard: before the lock-order fix, four concurrent accepts by one
+    // driver deadlocked (Postgres 40P01) because each transaction took its
+    // idempotency-row lock and then contended on the driver's advisory lock. The
+    // mirror this script used to run could not see it — it omitted both the
+    // advisory lock and the idempotency insert. Assert the code explicitly so a
+    // reintroduced cycle fails here by name rather than merely changing the count.
+    check(
+      "no accept deadlocks under contention",
+      !codes.includes("40P01") && !outcomes.some((o) => o.status === "rejected" && /deadlock/i.test(o.reason.message ?? "")),
+      JSON.stringify(codes),
+    );
 
     const trip = await pool.query("SELECT seats_reserved, seat_capacity FROM trip_occurrences WHERE id = $1", [fixture.tripId]);
     check(
@@ -196,32 +200,12 @@ const [driver, ...riders] = ids;
 {
   const fixture = await setup(driver, riders.slice(0, 2), 2);
   try {
-    const cancel = async () => {
-      const client = await pool.connect();
-      try {
-        await client.query("BEGIN");
-        await client.query(
-          `SELECT id FROM trip_occurrences WHERE id = $1 AND community_id = $2 FOR UPDATE`,
-          [fixture.tripId, CID],
-        );
-        await client.query(
-          `UPDATE ride_requests SET status = 'CANCELLED', updated_at = now()
-            WHERE trip_occurrence_id = $1 AND status IN ('REQUESTED','ACCEPTED')`,
-          [fixture.tripId],
-        );
-        await client.query(
-          `UPDATE trip_occurrences SET status = 'CANCELLED', seats_reserved = 0, updated_at = now()
-            WHERE id = $1 AND status = 'OPEN'`,
-          [fixture.tripId],
-        );
-        await client.query("COMMIT");
-      } catch (error) {
-        await client.query("ROLLBACK").catch(() => {});
-        throw error;
-      } finally {
-        client.release();
-      }
-    };
+    const cancel = () =>
+      cancelTripOccurrence({
+        actor: actorFor(driver),
+        tripOccurrenceId: fixture.tripId,
+        idempotencyKey: randomUUID(),
+      });
 
     await Promise.allSettled([
       cancel(),
@@ -292,12 +276,20 @@ const [driver, ...riders] = ids;
       trip.rows[0].seats_reserved <= trip.rows[0].seat_capacity && violations.length > 0,
       JSON.stringify({ trip: trip.rows[0], violations }),
     );
-  } finally {
-    await cleanup(fixture);
+    } finally {
+      await cleanup(fixture);
+    }
   }
-}
 
-let failed = 0;
+  // Remove the accounts this run created, in FK order.
+  for (const account of createdAccounts) {
+    await pool.query("DELETE FROM in_app_notifications WHERE recipient_user_id = $1 OR actor_user_id = $1", [account.userId]).catch(() => {});
+    await pool.query("DELETE FROM community_memberships WHERE user_id = $1", [account.userId]).catch(() => {});
+    await pool.query("DELETE FROM users WHERE id = $1", [account.userId]).catch(() => {});
+    await pool.query('DELETE FROM "user" WHERE id = $1', [account.authId]).catch(() => {});
+  }
+
+  let failed = 0;
 for (const r of results) {
   if (!r.p) failed += 1;
   console.log(`${r.p ? "PASS" : "FAIL"}  ${r.n}${r.p ? "" : `  -> ${r.d}`}`);

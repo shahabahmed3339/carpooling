@@ -61,6 +61,15 @@ type AreaAlias = {
   createdAt: string;
 };
 
+type AreaCoordinate = {
+  id: string;
+  area: string;
+  latitude: number;
+  longitude: number;
+  note: string | null;
+  createdAt: string;
+};
+
 type ApiError = { error?: { code?: string; message?: string } };
 
 async function api<T>(
@@ -105,6 +114,8 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
   const [aliases, setAliases] = useState<AreaAlias[]>([]);
   const [supportDraft, setSupportDraft] = useState({ contact: "", hours: "" });
   const [aliasDraft, setAliasDraft] = useState({ aliasArea: "", canonicalArea: "", note: "" });
+  const [coordinates, setCoordinates] = useState<AreaCoordinate[]>([]);
+  const [coordinateDraft, setCoordinateDraft] = useState({ area: "", latitude: "", longitude: "", note: "" });
   const [disputeNotes, setDisputeNotes] = useState<Record<string, string>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
@@ -126,6 +137,7 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
       setDisputes([]);
       setDisputeNotes({});
       setAliases([]);
+      setCoordinates([]);
       setNotes({});
       setHistory({});
       setHistoryVisibleId("");
@@ -144,11 +156,12 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
   const reload = useCallback(async () => {
     if (!accessValidRef.current) return;
     const seq = ++queueSeqRef.current;
-    const [reportResult, evidenceResult, disputeResult, aliasResult, supportResult] = await Promise.all([
+    const [reportResult, evidenceResult, disputeResult, aliasResult, coordinateResult, supportResult] = await Promise.all([
       api<{ reports: Report[]; closedReports: Report[] }>("/api/moderation/reports", accountId, clearSensitiveStateAndRedirect),
       api<{ evidence: NoShowEvidence[] }>("/api/moderation/no-shows", accountId, clearSensitiveStateAndRedirect),
       api<{ disputes: TripDispute[] }>("/api/moderation/disputes", accountId, clearSensitiveStateAndRedirect),
       api<{ aliases: AreaAlias[] }>("/api/area-aliases", accountId, clearSensitiveStateAndRedirect),
+      api<{ coordinates: AreaCoordinate[] }>("/api/area-coordinates", accountId, clearSensitiveStateAndRedirect),
       api<{ support: { contact: string | null; hours: string | null } }>("/api/support", accountId, clearSensitiveStateAndRedirect),
     ]);
     if (!accessValidRef.current || seq !== queueSeqRef.current) return;
@@ -157,6 +170,7 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
     setEvidence(evidenceResult.evidence);
     setDisputes(disputeResult.disputes);
     setAliases(aliasResult.aliases);
+    setCoordinates(coordinateResult.coordinates);
     setSupportDraft({
       contact: supportResult.support.contact ?? "",
       hours: supportResult.support.hours ?? "",
@@ -281,6 +295,57 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
     }
   }
 
+  async function saveCoordinate() {
+    setError("");
+    setNotice("");
+    const area = coordinateDraft.area.trim();
+    const latitude = Number(coordinateDraft.latitude);
+    const longitude = Number(coordinateDraft.longitude);
+    if (!area) {
+      setError("Enter the area name to place.");
+      return;
+    }
+    if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90) {
+      setError("Latitude must be a number between -90 and 90.");
+      return;
+    }
+    if (!Number.isFinite(longitude) || longitude < -180 || longitude > 180) {
+      setError("Longitude must be a number between -180 and 180.");
+      return;
+    }
+    setBusyId("new-coordinate");
+    try {
+      await api("/api/area-coordinates", accountId, clearSensitiveStateAndRedirect, {
+        method: "POST",
+        body: JSON.stringify({ area, latitude, longitude, note: coordinateDraft.note }),
+      });
+      if (!accessValidRef.current) return;
+      setCoordinateDraft({ area: "", latitude: "", longitude: "", note: "" });
+      setNotice("Area coordinate saved. Areas within the configured radius now match.");
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save the coordinate.");
+    } finally {
+      setBusyId("");
+    }
+  }
+
+  async function removeCoordinate(coordinateId: string) {
+    setError("");
+    setNotice("");
+    setBusyId(coordinateId);
+    try {
+      await api(`/api/area-coordinates/${coordinateId}`, accountId, clearSensitiveStateAndRedirect, { method: "DELETE" });
+      if (!accessValidRef.current) return;
+      setNotice("Area coordinate removed.");
+      await reload();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not remove the coordinate.");
+    } finally {
+      setBusyId("");
+    }
+  }
+
   async function toggleHistory(reportId: string) {
     if (historyVisibleId === reportId) {
       setHistoryVisibleId("");
@@ -391,8 +456,9 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
       <h2>Area aliases</h2>
       <p className={styles.muted}>
         Areas are matched by exact spelling, so “Gulberg” and “Gulberg III” never match on their own. Adding an
-        alias declares that two spellings mean the same place. Nothing is inferred from similarity or distance, so
-        only add an alias you are confident about: a wrong one can match riders to the wrong trip.
+        alias declares that two spellings mean the same place. Nothing is inferred from similarity, so only add an
+        alias you are confident about: a wrong one can match riders to the wrong trip. A separate distance rule
+        applies only to areas you have placed on the map below.
       </p>
       <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void addAlias(); }}>
         <label>Alias area<input maxLength={120} value={aliasDraft.aliasArea} onChange={(event) => setAliasDraft((current) => ({ ...current, aliasArea: event.target.value }))} placeholder="e.g. Gulberg III" /></label>
@@ -407,6 +473,32 @@ export default function ModerationReportsClient({ accountId }: { accountId: stri
             <p>{area.note ? `${area.note} · ` : ""}Added {new Date(area.createdAt).toLocaleString()}</p>
           </div>
           <button className={styles.danger} disabled={busyId === area.id} onClick={() => void removeAlias(area.id)}>Remove</button>
+        </div>
+      ))}
+    </section>
+
+    <section className={styles.panel}>
+      <h2>Area coordinates</h2>
+      <p className={styles.muted}>
+        Record where an approximate area is, so two differently named areas close together can still match — a rider
+        searching “Liberty Market” finds a trip leaving “Gulberg III” a kilometre away. Only areas you place here are
+        compared by distance; an area with no coordinate still matches by exact spelling or alias only. A wrong
+        coordinate silently widens matching, so place areas you know.
+      </p>
+      <form className={styles.form} onSubmit={(event) => { event.preventDefault(); void saveCoordinate(); }}>
+        <label>Area<input maxLength={120} value={coordinateDraft.area} onChange={(event) => setCoordinateDraft((current) => ({ ...current, area: event.target.value }))} placeholder="e.g. Gulberg III" /></label>
+        <label>Latitude<input inputMode="decimal" value={coordinateDraft.latitude} onChange={(event) => setCoordinateDraft((current) => ({ ...current, latitude: event.target.value }))} placeholder="e.g. 31.5204" /></label>
+        <label>Longitude<input inputMode="decimal" value={coordinateDraft.longitude} onChange={(event) => setCoordinateDraft((current) => ({ ...current, longitude: event.target.value }))} placeholder="e.g. 74.3587" /></label>
+        <label>Note (optional)<input maxLength={200} value={coordinateDraft.note} onChange={(event) => setCoordinateDraft((current) => ({ ...current, note: event.target.value }))} /></label>
+        <button disabled={busyId === "new-coordinate"}>Save coordinate</button>
+      </form>
+      {coordinates.length === 0 ? <p className={styles.muted}>No coordinates recorded. Distance matching is off for every area.</p> : coordinates.map((place) => (
+        <div className={styles.item} key={place.id}>
+          <div>
+            <strong>{place.area}</strong>
+            <p>{place.latitude.toFixed(5)}, {place.longitude.toFixed(5)}{place.note ? ` · ${place.note}` : ""}</p>
+          </div>
+          <button className={styles.danger} disabled={busyId === place.id} onClick={() => void removeCoordinate(place.id)}>Remove</button>
         </div>
       ))}
     </section>

@@ -26,13 +26,9 @@ const srcRoot = path.join(projectRoot, "src");
 
 const candidateExtensions = [".ts", ".tsx", ".js", ".mjs", ".cjs", ".json"];
 
-/** Resolve an `@/…` alias to a real file on disk. */
-function resolveAlias(specifier) {
-  const relative = specifier.slice(2); // strip "@/"
-  const base = path.join(srcRoot, relative);
-
+/** Try to resolve a path that may lack an extension or be a directory index. */
+function withExtensions(base) {
   if (existsSync(base) && path.extname(base) !== "") return base;
-
   for (const extension of candidateExtensions) {
     const withExtension = `${base}${extension}`;
     if (existsSync(withExtension)) return withExtension;
@@ -44,6 +40,11 @@ function resolveAlias(specifier) {
   return null;
 }
 
+/** Resolve an `@/…` alias to a real file on disk. */
+function resolveAlias(specifier) {
+  return withExtensions(path.join(srcRoot, specifier.slice(2)));
+}
+
 export async function resolve(specifier, context, nextResolve) {
   if (specifier.startsWith("@/")) {
     const resolved = resolveAlias(specifier);
@@ -52,6 +53,18 @@ export async function resolve(specifier, context, nextResolve) {
     }
     throw new Error(`Could not resolve alias ${specifier} under ${srcRoot}`);
   }
+
+  // The server sources use extensionless relative imports (e.g. `./errors`),
+  // which Next's bundler accepts but Node's ESM resolver does not. Resolve them
+  // the same way so an imported module's own imports load too.
+  if ((specifier.startsWith("./") || specifier.startsWith("../")) && !path.extname(specifier)) {
+    const parentDir = path.dirname(new URL(context.parentURL).pathname);
+    const resolved = withExtensions(path.resolve(parentDir, specifier));
+    if (resolved) {
+      return { url: pathToFileURL(resolved).href, shortCircuit: true };
+    }
+  }
+
   return nextResolve(specifier, context);
 }
 

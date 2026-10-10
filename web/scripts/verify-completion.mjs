@@ -1,11 +1,15 @@
 /**
  * Verify trip completion against the database's own CHECK constraints.
  *
- * This drives the real service functions in a transaction-free read/act loop and
- * then asserts the invariants the schema declares, rather than reading page text.
- * Run from web/: node scripts/verify-completion.mjs
+ * This is a read-only invariant check: it asserts the properties the schema
+ * declares across the live data. The one piece of production logic it needs is
+ * the no-show outcome classification, which it imports from the real
+ * `classifyOutcome` rather than re-deriving with its own CASE expression — a
+ * hand-copied rule would keep passing after the real classifier changed.
+ * Run from web/: npm run verify:completion
  */
 import nextEnv from "@next/env";
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 
 const { loadEnvConfig } = nextEnv;
@@ -19,9 +23,71 @@ const pool = new Pool({
   ssl: process.env.DATABASE_SSL === "true" ? { rejectUnauthorized: true } : undefined,
 });
 
+const { classifyOutcome } = await import("@/server/rides/completion");
+
 const results = [];
 function check(name, pass, detail) {
   results.push({ name, pass, detail });
+}
+
+/**
+ * Insert one no-show evidence row with known flags and confirm the stored
+ * outcome agrees with the real `classifyOutcome`. Without this the evidence
+ * check above is vacuous whenever the table is empty — which it is on a fresh
+ * database — so the classifier could change with nothing to catch it.
+ * Removes the row afterwards.
+ */
+async function checkClassifierAgreement() {
+  const accounts = await pool.query(
+    `SELECT u.id FROM users u
+      JOIN community_memberships m ON m.user_id = u.id AND m.community_id = $1
+     WHERE u.status = 'ACTIVE' AND m.status = 'ACTIVE' LIMIT 2`,
+    ["00000000-0000-4000-8000-000000000002"],
+  );
+  if (accounts.rowCount < 2) {
+    return { name: "classifier agrees with a known evidence row", pass: false, detail: "need two active accounts" };
+  }
+  const [rider, driver] = accounts.rows;
+  const commuteId = randomUUID();
+  const tripId = randomUUID();
+  const requestId = randomUUID();
+  const CID = "00000000-0000-4000-8000-000000000002";
+  const riderConfirmed = true;
+  const driverConfirmed = false;
+  const expected = classifyOutcome(riderConfirmed, driverConfirmed);
+  try {
+    await pool.query(
+      `INSERT INTO commute_templates (id,community_id,owner_user_id,origin_area,destination_area,departure_window_start,departure_window_end,role,seats_offered)
+       VALUES ($1,$2,$3,'vcoG','vcoD','08:00','08:20','OFFERING',1)`,
+      [commuteId, CID, driver.id],
+    );
+    await pool.query(
+      `INSERT INTO trip_occurrences (id,commute_template_id,community_id,driver_user_id,trip_date,departure_at,timezone,origin_area,destination_area,seat_capacity,seats_reserved,status)
+       SELECT $1,$2,$3,$4,((now()-interval '3 days') AT TIME ZONE 'Asia/Karachi')::date, now()-interval '3 days','Asia/Karachi','vcoG','vcoD',1,0,'COMPLETED'`,
+      [tripId, commuteId, CID, driver.id],
+    );
+    await pool.query(
+      `INSERT INTO ride_requests (id,trip_occurrence_id,community_id,rider_user_id,status,accepted_at,rider_confirmed_completion,driver_confirmed_completion)
+       VALUES ($1,$2,$3,$4,'EXPIRED', now()-interval '3 days', $5, $6)`,
+      [requestId, tripId, CID, rider.id, riderConfirmed, driverConfirmed],
+    );
+    await pool.query(
+      `INSERT INTO trip_no_show_evidence (ride_request_id,community_id,outcome,rider_confirmed,driver_confirmed,departed_at)
+       VALUES ($1,$2,$3,$4,$5, now()-interval '3 days')`,
+      [requestId, CID, expected, riderConfirmed, driverConfirmed],
+    );
+    const stored = await pool.query("SELECT outcome::text AS outcome FROM trip_no_show_evidence WHERE ride_request_id = $1", [requestId]);
+    return {
+      name: "classifier agrees with a known evidence row",
+      pass: stored.rows[0]?.outcome === expected,
+      detail: `expected=${expected} stored=${stored.rows[0]?.outcome}`,
+    };
+  } finally {
+    await pool.query("DELETE FROM trip_no_show_evidence WHERE ride_request_id = $1", [requestId]).catch(() => {});
+    await pool.query("DELETE FROM ride_requests WHERE id = $1", [requestId]).catch(() => {});
+    await pool.query("DELETE FROM trip_occurrences WHERE id = $1", [tripId]).catch(() => {});
+    await pool.query("DELETE FROM commute_templates WHERE id = $1", [commuteId]).catch(() => {});
+  }
 }
 
 async function main() {
@@ -81,19 +147,22 @@ async function main() {
 
   // No-show evidence must describe an expired request and must agree with the
   // flags it claims to have observed. A mismatch would mean the evidence was
-  // written from a different moment than the one it reports.
-  const badEvidence = await pool.query(`
-    SELECT e.ride_request_id, e.outcome, r.status, r.rider_confirmed_completion, r.driver_confirmed_completion
+  // written from a different moment than the one it reports. The expected
+  // outcome comes from the real classifier, so this cannot drift from the rule
+  // the app actually applies.
+  const evidenceRows = await pool.query(`
+    SELECT e.ride_request_id, e.outcome, e.rider_confirmed, e.driver_confirmed,
+           r.status, r.rider_confirmed_completion, r.driver_confirmed_completion
       FROM trip_no_show_evidence e
-      JOIN ride_requests r ON r.id = e.ride_request_id
-     WHERE r.status <> 'EXPIRED'
-        OR e.outcome::text <> CASE
-             WHEN e.rider_confirmed AND e.driver_confirmed THEN 'BOTH_CONFIRMED'
-             WHEN e.rider_confirmed THEN 'DRIVER_UNCONFIRMED'
-             WHEN e.driver_confirmed THEN 'RIDER_UNCONFIRMED'
-             ELSE 'NEITHER_CONFIRMED' END
-     LIMIT 10`);
-  check("no-show evidence matches its request and outcome", badEvidence.rowCount === 0, JSON.stringify(badEvidence.rows));
+      JOIN ride_requests r ON r.id = e.ride_request_id`);
+  const badEvidence = evidenceRows.rows.filter(
+    (row) => row.status !== "EXPIRED" || row.outcome !== classifyOutcome(row.rider_confirmed, row.driver_confirmed),
+  );
+  check(
+    "no-show evidence matches its request and outcome",
+    badEvidence.length === 0,
+    JSON.stringify(badEvidence.slice(0, 10)),
+  );
 
   // A request that settled normally must not also be recorded as a no-show.
   const wrongEvidence = await pool.query(`
@@ -111,6 +180,10 @@ async function main() {
     "SELECT outcome, count(*)::int AS n FROM trip_no_show_evidence GROUP BY outcome ORDER BY outcome",
   );
   console.log("No-show evidence:", JSON.stringify(evidenceCounts.rows));
+
+  // Non-vacuous classifier check (the invariant query above matches zero rows on
+  // an empty table, so it alone cannot catch a classifier change).
+  results.push(await checkClassifierAgreement());
 
   let failed = 0;
   for (const result of results) {

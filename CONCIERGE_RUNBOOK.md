@@ -56,4 +56,14 @@ The queue refreshes on focus and every 30 seconds while open, but **sends no ale
 
 ## Operational support
 
-Before real use, publish support contact/hours, cancellation/no-show/cost-sharing rules, report/block flow, retention/deletion policy, and an incident escalation procedure in the app. Current product testing does not provide those operational services automatically. Do not promise safety monitoring or emergency response. `npm run db:audit-retention` reports aged data volumes to inform the retention policy; no retention window is applied to reports, trips, or closed accounts yet.
+Before real use, publish support contact/hours, cancellation/no-show/cost-sharing rules, report/block flow, retention/deletion policy, and an incident escalation procedure in the app. Current product testing does not provide those operational services automatically. Do not promise safety monitoring or emergency response.
+
+### Scheduled cleanup
+
+Run `npm run db:maintenance` on a schedule (e.g. daily). It runs all three bounded cleanup commands and exits non-zero if any step failed, so a scheduler can alert. Preview with `npm run db:maintenance -- --dry-run`, which deletes nothing.
+
+- `db:prune-notifications` — read notifications older than the window (default 90 days).
+- `db:prune-idempotency` — expired mutation receipts (24-hour window).
+- `db:prune-history` — settled trips/requests, evidence and disputes older than the window (default 365 days).
+
+`db:prune-history` never deletes a trip that a safety report references, and never deletes unsettled history; it prints what it therefore held back. Closed-account tombstones and safety reports have **no** applied window by design — those are policy decisions, not storage ones. `npm run db:audit-retention -- --as-of-days=<n>` reports aged volumes so a window can be chosen from real numbers.

@@ -122,3 +122,98 @@ export async function deleteAreaAlias(input: {
     if (result.rowCount !== 1) throw notFound();
   });
 }
+
+export type AreaCoordinate = {
+  id: string;
+  area: string;
+  latitude: number;
+  longitude: number;
+  note: string | null;
+  createdAt: string;
+};
+
+/**
+ * Coordinates are maintained by the same reviewers/operators who maintain
+ * aliases: a coordinate is a factual claim about where a place is, and a wrong
+ * one silently mismatches riders with drivers, so it is not a user preference.
+ */
+export async function listAreaCoordinates(actor: AuthenticatedActor): Promise<AreaCoordinate[]> {
+  return inTransaction(async (client) => {
+    await assertActiveCommunityMember(client, actor.communityId, actor.userId);
+    const result = await client.query<AreaCoordinate>(
+      `SELECT id,
+              area,
+              latitude::float8 AS latitude,
+              longitude::float8 AS longitude,
+              note,
+              to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS "createdAt"
+         FROM area_coordinates
+        WHERE community_id = $1
+        ORDER BY area ASC, id ASC
+        LIMIT 500`,
+      [actor.communityId],
+    );
+    return result.rows;
+  });
+}
+
+/**
+ * Record (or update) the coordinate of an area.
+ *
+ * The area is normalized exactly as search normalizes it, so a coordinate always
+ * keys the same string an alias or a trip would. Re-declaring an area updates
+ * its position rather than creating a second row, because two positions for one
+ * name would make matching depend on row order.
+ */
+export async function upsertAreaCoordinate(input: {
+  actor: AuthenticatedActor;
+  area: string;
+  latitude: number;
+  longitude: number;
+  note: string | null;
+}): Promise<AreaCoordinate> {
+  const area = normalizeArea(input.area);
+  if (area === null) throw invalid("INVALID_AREA", "The area must be 1 to 120 characters.");
+  if (!Number.isFinite(input.latitude) || input.latitude < -90 || input.latitude > 90) {
+    throw invalid("INVALID_LATITUDE", "Latitude must be between -90 and 90.");
+  }
+  if (!Number.isFinite(input.longitude) || input.longitude < -180 || input.longitude > 180) {
+    throw invalid("INVALID_LONGITUDE", "Longitude must be between -180 and 180.");
+  }
+  const note = input.note === null ? null : input.note.trim().slice(0, 200) || null;
+
+  return inTransaction(async (client) => {
+    await assertAliasManager(client, input.actor);
+    const saved = await client.query<AreaCoordinate>(
+      `INSERT INTO area_coordinates (id, community_id, area, latitude, longitude, note)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (community_id, area) DO UPDATE
+         SET latitude = EXCLUDED.latitude,
+             longitude = EXCLUDED.longitude,
+             note = EXCLUDED.note,
+             updated_at = now()
+       RETURNING id,
+                 area,
+                 latitude::float8 AS latitude,
+                 longitude::float8 AS longitude,
+                 note,
+                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') AS "createdAt"`,
+      [randomUUID(), input.actor.communityId, area, input.latitude, input.longitude, note],
+    );
+    return saved.rows[0];
+  });
+}
+
+export async function deleteAreaCoordinate(input: {
+  actor: AuthenticatedActor;
+  coordinateId: string;
+}): Promise<void> {
+  return inTransaction(async (client) => {
+    await assertAliasManager(client, input.actor);
+    const result = await client.query(
+      "DELETE FROM area_coordinates WHERE id = $1 AND community_id = $2 RETURNING id",
+      [input.coordinateId, input.actor.communityId],
+    );
+    if (result.rowCount !== 1) throw notFound();
+  });
+}

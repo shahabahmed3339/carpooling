@@ -1,5 +1,14 @@
+/**
+ * Delete expired idempotency records, bounded per run.
+ *
+ * Usage:
+ *   node ./scripts/prune-idempotency.mjs              # delete up to 500 expired rows
+ *   node ./scripts/prune-idempotency.mjs --dry-run    # count only, delete nothing
+ */
 import nextEnv from "@next/env";
 import { Pool } from "pg";
+
+const dryRun = process.argv.includes("--dry-run");
 
 const { loadEnvConfig } = nextEnv;
 loadEnvConfig(process.cwd(), process.env.NODE_ENV === "development", {
@@ -49,25 +58,43 @@ try {
   transactionOpen = true;
   await client.query("SET LOCAL lock_timeout = '2s'");
   await client.query("SET LOCAL statement_timeout = '10s'");
-  const result = await client.query(
-    `WITH expired AS (
-       SELECT actor_user_id, operation, key_sha256
-         FROM idempotency_records
-        WHERE expires_at <= clock_timestamp()
-        ORDER BY expires_at
-        LIMIT $1
-        FOR UPDATE SKIP LOCKED
-     )
-     DELETE FROM idempotency_records records
-      USING expired
-      WHERE records.actor_user_id = expired.actor_user_id
-        AND records.operation = expired.operation
-        AND records.key_sha256 = expired.key_sha256`,
-    [batchSize],
-  );
-  await client.query("COMMIT");
-  transactionOpen = false;
-  process.stdout.write(`Pruned ${result.rowCount ?? 0} expired idempotency record(s).\n`);
+  // A dry run reports what the same LIMIT would remove, then rolls back so the
+  // command is safe to run against any database to preview a schedule.
+  const result = dryRun
+    ? await client.query(
+        `SELECT count(*)::int AS n FROM (
+           SELECT 1 FROM idempotency_records
+            WHERE expires_at <= clock_timestamp()
+            ORDER BY expires_at
+            LIMIT $1
+         ) eligible`,
+        [batchSize],
+      )
+    : await client.query(
+        `WITH expired AS (
+           SELECT actor_user_id, operation, key_sha256
+             FROM idempotency_records
+            WHERE expires_at <= clock_timestamp()
+            ORDER BY expires_at
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+         )
+         DELETE FROM idempotency_records records
+          USING expired
+          WHERE records.actor_user_id = expired.actor_user_id
+            AND records.operation = expired.operation
+            AND records.key_sha256 = expired.key_sha256`,
+        [batchSize],
+      );
+  if (dryRun) {
+    await client.query("ROLLBACK");
+    transactionOpen = false;
+    process.stdout.write(`Dry run: ${result.rows[0]?.n ?? 0} expired idempotency record(s) would be pruned.\n`);
+  } else {
+    await client.query("COMMIT");
+    transactionOpen = false;
+    process.stdout.write(`Pruned ${result.rowCount ?? 0} expired idempotency record(s).\n`);
+  }
 } catch (error) {
   if (client && transactionOpen) {
     try {
